@@ -230,7 +230,7 @@ function install_netdata() {
     success "Netdata already installed and running."
   else
     info "Installing Netdata monitoring dashboard..."
-    bash <(curl -Ss https://my-netdata.io/kickstart.sh) --disable-telemetry
+    bash <(curl -Ss https://get.netdata.cloud/kickstart.sh) --disable-telemetry
     ufw allow 19999
     success "Netdata installed. Access via https://your-server-ip:19999"
   fi
