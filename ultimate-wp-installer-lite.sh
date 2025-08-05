@@ -497,3 +497,4 @@ function main() {
   fi
 }
 
+main "$@"
