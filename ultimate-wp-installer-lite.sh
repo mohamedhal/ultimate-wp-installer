@@ -491,6 +491,22 @@ function main() {
     info "No command provided. Starting interactive setup..."
     read -rp "Enter your first domain to install WordPress (or leave blank to skip): " domain
     if [ -n "$domain" ]; then
+    addsite() {
+    DOMAIN=$1
+    if [ -z "$DOMAIN" ]; then
+        echo "No domain provided. Skipping site installation."
+        return 0
+    fi
+
+    echo "[INFO] Creating WordPress site for domain: $DOMAIN"
+    wo site create $DOMAIN --wp
+    if [ $? -eq 0 ]; then
+        echo "[✓] WordPress site $DOMAIN installed successfully."
+    else
+        echo "[✗] Failed to install WordPress site $DOMAIN."
+    fi
+}
+
       addsite "$domain"
     fi
     success "Installation complete! Use 'commands' to see available commands."
