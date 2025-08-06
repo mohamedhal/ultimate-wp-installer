@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ##################################################################################
-# # WordPress Ultimate Operations (WOO) Toolkit - V8.0 (Final Version)             #
+# # WordPress Ultimate Operations (WOO) Toolkit - V8.1 (Final Version)             #
 # #                                                                                #
 # # This script provides a comprehensive, enterprise-grade solution for deploying  #
 # # and managing high-performance, secure, and completely isolated WordPress sites.#
@@ -211,12 +211,12 @@ secure_mysql() {
 
     local db_root_pass
     db_root_pass=$(openssl rand -base64 32)
-    local service_name="mariadb" # Hardcode the service name as per user feedback
+    local service_name="mariadb"
 
     log "Forcefully resetting MariaDB root password..."
-    sudo systemctl stop "$service_name"
-    sudo systemctl disable "$service_name"
-    sudo pkill -9 mysql
+    sudo systemctl stop "$service_name" || true
+    sudo systemctl disable "$service_name" || true
+    sudo pkill -9 mysql || true
     sleep 3
 
     if pgrep mysqld; then
@@ -1001,41 +1001,56 @@ main_menu() {
     done
 }
 
-if [[ "$1" == "backup-all" ]]; then
-    backup_all_sites
-    exit 0
-fi
-
-if [[ "$1" == "remove-site-silent" && -n "$2" ]]; then
-    domain=$2
-    site_dir="${WEBROOT}/${domain}"
-    db_name=$(grep "DB_NAME" "${site_dir}/wp-config.php" | cut -d \' -f 4)
-    db_user=$(grep "DB_USER" "${site_dir}/wp-config.php" | cut -d \' -f 4)
+remove_site_silent() {
+    local domain="$1"
+    local site_dir="${WEBROOT}/${domain}"
+    local db_name db_user
+    
+    if [ -f "${site_dir}/wp-config.php" ]; then
+        db_name=$(grep "DB_NAME" "${site_dir}/wp-config.php" | cut -d \' -f 4)
+        db_user=$(grep "DB_USER" "${site_dir}/wp-config.php" | cut -d \' -f 4)
+    fi
+    
     sudo rm -f "/etc/nginx/sites-available/${domain}" "/etc/nginx/sites-enabled/${domain}"
     sudo rm -f "/etc/php/${PHP_VERSION}/fpm/pool.d/${domain}.conf"
-    mysql --defaults-file="$HOME/.my.cnf" -e "DROP DATABASE IF EXISTS \`${db_name}\`; DROP USER IF EXISTS '${db_user}'@'localhost';"
+    if [[ -n "$db_name" ]]; then
+        mysql --defaults-file="$HOME/.my.cnf" -e "DROP DATABASE IF EXISTS \`${db_name}\`; DROP USER IF EXISTS '${db_user}'@'localhost';"
+    fi
     sudo rm -rf "$site_dir"
     sudo systemctl reload nginx php${PHP_VERSION}-fpm
-    exit 0
-fi
+}
 
-check_user
+main() {
+    if [[ "$1" == "backup-all" ]]; then
+        backup_all_sites
+        exit 0
+    fi
 
-if [ ! -f "$HOME/.my.cnf" ]; then
-    clear
-    echo -e "${GREEN}--- Initial Server Setup for WOO Toolkit ---${NC}\n"
-    warn "This appears to be the first run. The script will now set up and secure the server."
-    read -p "Press Enter to begin the one-time setup..."
-    
-    analyze_system
-    install_dependencies
-    secure_mysql
-    configure_tuned_mariadb
-    harden_server
-    
-    echo -e "\n${GREEN}Initial server setup is complete!${NC}"
-    read -p "Enter a valid email address for SSL certificates and admin notifications: " ADMIN_EMAIL
-    setup_alias
-fi
+    if [[ "$1" == "remove-site-silent" && -n "$2" ]]; then
+        remove_site_silent "$2"
+        exit 0
+    fi
 
-main_menu
+    check_user
+
+    if [ ! -f "$HOME/.my.cnf" ]; then
+        clear
+        echo -e "${GREEN}--- Initial Server Setup for WOO Toolkit ---${NC}\n"
+        warn "This appears to be the first run. The script will now set up and secure the server."
+        read -p "Press Enter to begin the one-time setup..."
+        
+        analyze_system
+        install_dependencies
+        secure_mysql
+        configure_tuned_mariadb
+        harden_server
+        
+        echo -e "\n${GREEN}Initial server setup is complete!${NC}"
+        read -p "Enter a valid email address for SSL certificates and admin notifications: " ADMIN_EMAIL
+        setup_alias
+    fi
+
+    main_menu
+}
+
+main "$@"
