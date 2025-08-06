@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ##################################################################################
-# # WordPress Ultimate Operations (WOO) Toolkit - V8.1 (Final Version)             #
+# # WordPress Ultimate Operations (WOO) Toolkit - V8.2 (Ghost File Cleanup)        #
 # #                                                                                #
 # # This script provides a comprehensive, enterprise-grade solution for deploying  #
 # # and managing high-performance, secure, and completely isolated WordPress sites.#
@@ -110,7 +110,7 @@ check_user() {
         warn "It's safer to run as a regular user with sudo privileges."
         read -p "Press Enter to continue as root, or Ctrl+C to exit."
     elif ! sudo -v >/dev/null 2>&1; then
-        fail "This script requires the ability to run commands with sudo. Please run as a user with sudo privileges."
+        fail "This script requires the ability to run commands with sudo. Please enter your password when prompted."
     fi
 }
 
@@ -224,6 +224,10 @@ secure_mysql() {
     fi
     log "Database process successfully terminated."
 
+    log "Cleaning up stale socket and PID files..."
+    sudo find /var/run/mysqld/ -name "*.sock" -delete || true
+    sudo find /var/run/mysqld/ -name "*.pid" -delete || true
+    
     sudo mysqld_safe --skip-grant-tables --skip-networking &
     local mysqld_pid=$!
     log "Started mysqld in safe mode with PID $mysqld_pid"
