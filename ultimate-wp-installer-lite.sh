@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ##################################################################################
-# # WordPress Ultimate Operations (WOO) Toolkit - V7.3 (Resilient DB Security)     #
+# # WordPress Ultimate Operations (WOO) Toolkit - V7.4 (Definitive DB Security)    #
 # #                                                                                #
 # # This script provides a comprehensive, enterprise-grade solution for deploying  #
 # # and managing high-performance, secure, and completely isolated WordPress sites.#
@@ -230,9 +230,12 @@ secure_mysql() {
     sudo mysqld_safe --skip-grant-tables --skip-networking &
     sleep 5
 
-    # Use a modern command for MariaDB 10.4+
-    sudo mysql -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '${db_root_pass}';"
-    sudo mysql -u root -e "FLUSH PRIVILEGES;"
+    # The DEFINITIVE sequence to reset a password, regardless of version
+    sudo mysql -u root <<EOF
+FLUSH PRIVILEGES;
+ALTER USER 'root'@'localhost' IDENTIFIED BY '${db_root_pass}';
+FLUSH PRIVILEGES;
+EOF
 
     sudo killall mysqld
     sleep 5
