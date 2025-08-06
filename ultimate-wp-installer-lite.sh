@@ -22,8 +22,8 @@ readonly PHP_VERSION="8.2"
 readonly WEBROOT="/var/www"
 readonly BACKUP_DIR="$HOME/wp-backups"
 readonly LOG_FILE="$HOME/wp-installer-$(date +%Y%m%d).log"
-# ⚠️ IMPORTANT: Change this to a valid email address.
-readonly ADMIN_EMAIL="your-email@example.com"
+# The ADMIN_EMAIL variable is now set by user input.
+ADMIN_EMAIL=""
 readonly MAX_RETRIES=3
 readonly MIN_RAM=2048   # 2GB in MB
 readonly MIN_DISK=10240 # 10GB in MB
@@ -244,7 +244,8 @@ create_php_pool() {
     local domain="$1"
     local pool_file="/etc/php/${PHP_VERSION}/fpm/pool.d/${domain}.conf"
     
-    local total_ram=$($INSTALL_SUDO free -m | awk '/Mem:/ {print int($2*0.5)"M"}' || echo "1G")
+    # Corrected function to handle memory value without 'M'
+    local total_ram=$(free -m | awk '/Mem:/ {print $2}')
     local pm_max_children=$(( total_ram / 100 ))
     (( pm_max_children < 5 )) && pm_max_children=5
     
@@ -532,6 +533,16 @@ main() {
     setup_backups
     
     echo -e "\n${YELLOW}Initial setup complete. Now installing WordPress...${NC}"
+
+    # Prompt user for email address
+    while true; do
+        read -p "Enter a valid email address for SSL certificates and notifications: " ADMIN_EMAIL
+        if [[ "$ADMIN_EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+            break
+        else
+            warn "Invalid email address. Please try again."
+        fi
+    done
     
     while true; do
         read -p "Enter domain name to install WordPress (or 'exit'): " raw_domain
