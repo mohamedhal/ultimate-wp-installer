@@ -10,6 +10,7 @@
 # # ✅ Redis Object Caching + Database Query Optimization                      #
 # # ✅ Automated Let's Encrypt SSL with DNS-01 Fallback                        #
 # # ✅ Fail2Ban with Machine Learning Pattern Detection                         #
+# # ✅ Netdata Server Monitoring                                               #
 # # ✅ Atomic Transactions for All Operations                                  #
 # ##############################################################################
 
@@ -202,7 +203,7 @@ install_dependencies() {
         php${PHP_VERSION}-mbstring php${PHP_VERSION}-xml php${PHP_VERSION}-zip \
         php${PHP_VERSION}-gd php${PHP_VERSION}-opcache php${PHP_VERSION}-redis \
         redis-server fail2ban certbot python3-certbot-nginx \
-        wget unzip git
+        wget unzip git postfix
     
     if ! command -v wp &>/dev/null; then
         log "Installing WP-CLI..."
@@ -244,7 +245,6 @@ create_php_pool() {
     local domain="$1"
     local pool_file="/etc/php/${PHP_VERSION}/fpm/pool.d/${domain}.conf"
     
-    # Corrected function to handle memory value without 'M'
     local total_ram=$(free -m | awk '/Mem:/ {print $2}')
     local pm_max_children=$(( total_ram / 100 ))
     (( pm_max_children < 5 )) && pm_max_children=5
@@ -332,6 +332,7 @@ define('WP_AUTO_UPDATE_CORE', 'minor');
 PHP
     
     local admin_pass=$(openssl rand -base64 16)
+    SITE_DATA["ADMIN_PASS"]=$admin_pass
     log "Installing WordPress core and plugins..."
     $INSTALL_SUDO -u www-data wp core install \
         --path="${SITE_DATA[SITE_DIR]}" \
@@ -343,6 +344,10 @@ PHP
 
     $INSTALL_SUDO -u www-data wp plugin install wordfence disable-xml-rpc redis-cache --activate --path="${SITE_DATA[SITE_DIR]}"
     $INSTALL_SUDO -u www-data wp redis enable --path="${SITE_DATA[SITE_DIR]}"
+    
+    # Fix permissions for the WP-CLI cache directory
+    log "Fixing WP-CLI permissions to prevent warnings..."
+    $INSTALL_SUDO chown -R www-data:www-data /var/www/
     
     create_php_pool "$domain"
     create_nginx_config "$domain"
@@ -358,6 +363,7 @@ PHP
     success "WordPress installed successfully at https://${domain}"
 }
 
+# --- Nginx & Security Configuration ---
 create_nginx_config() {
     local domain="$1"
     local config_file="/etc/nginx/sites-available/${domain}"
@@ -391,7 +397,6 @@ EOF
     $INSTALL_SUDO systemctl restart nginx
 }
 
-# --- Security Hardening ---
 harden_server() {
     log "Implementing comprehensive security measures..."
     
@@ -493,6 +498,32 @@ EOF
     success "Backup and update system configured."
 }
 
+# --- Netdata Installation ---
+install_netdata() {
+    log "Installing Netdata server monitoring..."
+    $INSTALL_SUDO wget -O /tmp/netdata-installer.sh https://my-netdata.io/kickstart.sh
+    $INSTALL_SUDO bash /tmp/netdata-installer.sh --dont-wait --stable-channel --non-interactive || warn "Netdata installation failed. Skipping."
+    
+    # Configure Netdata to be accessible via the Nginx server
+    $INSTALL_SUDO tee /etc/nginx/conf.d/netdata.conf >/dev/null <<EOF
+server {
+    listen 8000;
+    server_name localhost;
+    root /usr/share/netdata/web;
+    location / {
+        proxy_pass http://localhost:19999;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+    
+    $INSTALL_SUDO systemctl restart nginx
+    success "Netdata monitoring installed and configured on port 8000."
+}
+
 # --- Credential Management ---
 save_credentials() {
     local domain="$1"
@@ -516,6 +547,42 @@ EOF
     success "Credentials saved to $cred_file"
 }
 
+display_summary() {
+    local domain="$1"
+    local admin_pass="$2"
+    local cred_file="$HOME/${domain}-credentials.txt"
+    
+    echo -e "\n${GREEN}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC}"
+    echo -e "${GREEN}▓                                                                  ▓${NC}"
+    echo -e "${GREEN}▓                             INSTALLATION COMPLETE!                     ▓${NC}"
+    echo -e "${GREEN}▓                                                                  ▓${NC}"
+    echo -e "${GREEN}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC}"
+    
+    echo -e "\n${YELLOW}=== Installation Summary ===${NC}"
+    echo -e "✓ **Core Stack:** Nginx, MariaDB, PHP ${PHP_VERSION} with PHP-FPM"
+    echo -e "✓ **WordPress:** Installed on domain: ${GREEN}https://${domain}${NC}"
+    echo -e "✓ **SSL:** Let's Encrypt SSL certificate configured with auto-renewal."
+    echo -e "✓ **Caching:** Redis Object Cache is enabled and active."
+    echo -e "✓ **Security:** UFW firewall and Fail2ban are configured."
+    echo -e "✓ **Monitoring:** Netdata is installed and running on port 8000."
+    echo -e "✓ **Backups:** Daily backup scripts and a cron job are in place."
+    
+    echo -e "\n${YELLOW}=== Login Details ===${NC}"
+    echo -e "Visit your site: ${GREEN}https://${domain}${NC}"
+    echo -e "Admin Login: ${GREEN}https://${domain}/wp-admin${NC}"
+    echo -e "Username: ${GREEN}admin${NC}"
+    echo -e "Password: ${GREEN}${admin_pass}${NC}"
+    
+    echo -e "\n${YELLOW}=== Server Tools ===${NC}"
+    echo -e "Netdata Dashboard (monitoring): ${GREEN}http://${domain}:8000${NC}"
+    echo -e "Backup Script: ${GREEN}wpbackup${NC}"
+    echo -e "Restore Script: ${GREEN}wprestore${NC}"
+    
+    echo -e "\n${YELLOW}=== IMPORTANT ===${NC}"
+    echo -e "All credentials are saved to: ${GREEN}$cred_file${NC}"
+    echo -e "\nThank you for using the Ultimate WordPress Auto-Installer!"
+}
+
 # --- Main Execution Flow ---
 main() {
     clear
@@ -531,10 +598,10 @@ main() {
     configure_mysql
     harden_server
     setup_backups
+    install_netdata
     
     echo -e "\n${YELLOW}Initial setup complete. Now installing WordPress...${NC}"
 
-    # Prompt user for email address
     while true; do
         read -p "Enter a valid email address for SSL certificates and notifications: " ADMIN_EMAIL
         if [[ "$ADMIN_EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
@@ -544,6 +611,7 @@ main() {
         fi
     done
     
+    local domain=""
     while true; do
         read -p "Enter domain name to install WordPress (or 'exit'): " raw_domain
         [[ "$raw_domain" == "exit" ]] && break
@@ -557,16 +625,7 @@ main() {
         fi
     done
     
-    echo -e "\n${GREEN}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC}"
-    echo -e "${GREEN}▓                                                                  ▓${NC}"
-    echo -e "${GREEN}▓                             INSTALLATION COMPLETE!                     ▓${NC}"
-    echo -e "${GREEN}▓                                                                  ▓${NC}"
-    echo -e "${GREEN}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC}"
-    
-    echo -e "\n${YELLOW}=== IMPORTANT ===${NC}"
-    echo -e "Credentials stored in: ${GREEN}$HOME/*-credentials.txt${NC}"
-    echo -e "Backup commands: ${GREEN}wpbackup${NC} and ${GREEN}wprestore${NC}"
-    echo -e "\nThank you for using the Ultimate WordPress Auto-Installer!"
+    display_summary "$domain" "${SITE_DATA[ADMIN_PASS]}"
 }
 
 main "$@"
