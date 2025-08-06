@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ##################################################################################
-# # WordPress Ultimate Operations (WOO) Toolkit - V8.6 (Final Version)             #
+# # WordPress Ultimate Operations (WOO) Toolkit - V9.0 (Final Version)             #
 # #                                                                                #
 # # This script provides a comprehensive, enterprise-grade solution for deploying  #
 # # and managing high-performance, secure, and completely isolated WordPress sites.#
@@ -212,7 +212,6 @@ secure_mysql() {
     local db_root_pass
     db_root_pass=$(openssl rand -base64 32)
     
-    # Standard, best-practice sequence for a fresh MariaDB installation
     sudo mysql -u root <<EOF
 ALTER USER 'root'@'localhost' IDENTIFIED BY '${db_root_pass}';
 DELETE FROM mysql.user WHERE User='';
@@ -264,13 +263,27 @@ EOF
     log "Setting up XML-RPC IP Whitelist..."
     if [ ! -f "$XMLRPC_WHITELIST_FILE" ]; then
         sudo tee "$XMLRPC_WHITELIST_FILE" >/dev/null <<EOF
-# This file is managed by the WOO Toolkit. Do not edit manually.
-# Whitelisted IPs for XML-RPC access.
+# This file is managed by the WOO Toolkit.
 geo \$xmlrpc_allowed {
     default 0;
 }
 EOF
     fi
+
+    log "Creating default Nginx placeholder site..."
+    sudo tee /etc/nginx/sites-available/default >/dev/null <<'EOF'
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    root /var/www/html;
+    return 444; # No Response
+}
+EOF
+    if [ ! -L "/etc/nginx/sites-enabled/default" ]; then
+        sudo ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
+    fi
+    sudo systemctl reload nginx
     
     sudo systemctl restart php${PHP_VERSION}-fpm
     success "Server hardening complete."
@@ -518,8 +531,7 @@ if (!-e \$request_filename) {
 
     sudo tee "$config_file" >/dev/null <<EOF
 server {
-    listen 443 ssl;
-    http2 on;
+    listen 443 ssl http2;
     server_name ${domain} www.${domain};
     root ${WEBROOT}/${domain};
     index index.php;
@@ -578,28 +590,32 @@ list_sites() {
 
 select_site() {
     local sites
-    sites=($(ls -1 "${WEBROOT}" | grep -v 'html'))
+    sites=($(ls -1 "${WEBROOT}" | grep -v 'html' 2>/dev/null))
     if [ ${#sites[@]} -eq 0 ]; then
         warn "No sites available to manage."
-        return
+        return 1
     fi
     
-    echo "Select a site to manage:"
-    select domain in "${sites[@]}"; do
-        if [[ -n "$domain" ]]; then
-            echo "$domain"
-            return
-        else
-            warn "Invalid selection."
-        fi
+    echo "Please select a site to manage:"
+    for i in "${!sites[@]}"; do
+        echo "  $((i+1))) ${sites[$i]}"
     done
+    
+    local choice
+    read -p "Enter number: " choice
+    
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -gt 0 ] && [ "$choice" -le "${#sites[@]}" ]; then
+        echo "${sites[$((choice-1))]}"
+    else
+        warn "Invalid selection."
+        return 1
+    fi
 }
 
 manage_caching() {
     clear; echo -e "${BLUE}--- Manage Site Caching ---${NC}\n"
     local domain
-    domain=$(select_site)
-    [[ -z "$domain" ]] && return
+    domain=$(select_site) || return
     
     local nginx_conf="/etc/nginx/sites-available/${domain}"
     
@@ -681,8 +697,7 @@ manage_backups() {
 
 create_on_demand_backup() {
     local domain
-    domain=$(select_site)
-    [[ -z "$domain" ]] && return
+    domain=$(select_site) || return
     
     log "Starting backup for ${domain}..."
     local site_dir="${WEBROOT}/${domain}"
@@ -776,8 +791,7 @@ backup_all_sites() {
 clone_to_staging() {
     clear; echo -e "${BLUE}--- Clone Site to Staging ---${NC}\n"
     local domain
-    domain=$(select_site)
-    [[ -z "$domain" ]] && return
+    domain=$(select_site) || return
     
     local staging_domain="staging.${domain}"
     local site_dir="${WEBROOT}/${domain}"
@@ -825,8 +839,8 @@ clone_to_staging() {
 site_toolkit() {
     clear; echo -e "${BLUE}--- Site Toolkit (WP-CLI) ---${NC}\n"
     local domain
-    domain=$(select_site)
-    [[ -z "$domain" ]] && return
+    domain=$(select_site) || return
+    
     local site_dir="${WEBROOT}/${domain}"
     
     while true; do
@@ -853,8 +867,8 @@ site_toolkit() {
 manage_debugging() {
     clear; echo -e "${BLUE}--- Debugging Tools ---${NC}\n"
     local domain
-    domain=$(select_site)
-    [[ -z "$domain" ]] && return
+    domain=$(select_site) || return
+    
     local site_dir="${WEBROOT}/${domain}"
     
     while true; do
