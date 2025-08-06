@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ##################################################################################
-# # WordPress Ultimate Operations (WOO) Toolkit - V8.5 (Heartbeat Check)           #
+# # WordPress Ultimate Operations (WOO) Toolkit - V8.0 (Final Version)             #
 # #                                                                                #
 # # This script provides a comprehensive, enterprise-grade solution for deploying  #
 # # and managing high-performance, secure, and completely isolated WordPress sites.#
@@ -211,75 +211,18 @@ secure_mysql() {
 
     local db_root_pass
     db_root_pass=$(openssl rand -base64 32)
-    local service_name="mariadb"
-    local temp_socket="/tmp/mysql.sock"
-
-    log "Forcefully resetting MariaDB root password..."
-    sudo systemctl stop "$service_name" || true
-    sudo systemctl disable "$service_name" || true
-    sudo pkill -9 mysql || true
-    sleep 3
-
-    if pgrep mysqld; then
-        fail "Failed to stop the MariaDB/MySQL process. Manual intervention is required."
-    fi
-    log "Database process successfully terminated."
-
-    log "Cleaning up stale socket and PID files..."
-    sudo find /var/run/mysqld/ -name "*.sock" -delete || true
-    sudo find /var/run/mysqld/ -name "*.pid" -delete || true
     
-    sudo mysqld_safe --skip-grant-tables --skip-networking --socket="$temp_socket" &
-    local mysqld_pid=$!
-    log "Started mysqld in safe mode with PID $mysqld_pid on socket $temp_socket"
-    
-    log "Waiting for temporary socket to become available..."
-    local counter=0
-    while [ ! -S "$temp_socket" ]; do
-        # Heartbeat check: See if the PID is still alive.
-        if ! sudo kill -0 "$mysqld_pid" > /dev/null 2>&1; then
-            fail "The MariaDB safe mode process died unexpectedly. Check system logs for the reason (e.g., 'sudo journalctl -u mariadb' or 'sudo tail /var/log/syslog')."
-        fi
-        ((counter++))
-        if [ "$counter" -gt 30 ]; then # 30 second timeout
-            fail "Timed out waiting for the MariaDB safe mode socket. The process may be stuck."
-        fi
-        sleep 1
-    done
-    success "Temporary socket is active."
-
-    local sql_file="/tmp/mysql-reset-$$.sql"
-    tee "$sql_file" >/dev/null <<EOF
-FLUSH PRIVILEGES;
+    # Standard, best-practice sequence for a fresh MariaDB installation
+    sudo mysql -u root <<EOF
 ALTER USER 'root'@'localhost' IDENTIFIED BY '${db_root_pass}';
-FLUSH PRIVILEGES;
-EOF
-
-    log "Executing password reset on temporary socket..."
-    sudo mysql --socket="$temp_socket" -u root < "$sql_file"
-    rm -f "$sql_file"
-    
-    log "Killing safe mode PID $mysqld_pid..."
-    sudo kill -9 "$mysqld_pid"
-    sleep 3
-    
-    log "Re-enabling and restarting MariaDB service..."
-    sudo systemctl enable "$service_name"
-    sudo systemctl start "$service_name"
-
-    log "MariaDB root password has been reset."
-    
-    echo -e "[client]\nuser=root\npassword=${db_root_pass}" > "$HOME/.my.cnf"
-    chmod 600 "$HOME/.my.cnf"
-    
-    log "Cleaning up anonymous users and test database..."
-    mysql --defaults-file="$HOME/.my.cnf" <<EOF
-DELETE FROM mysql.global_priv WHERE User='';
-DELETE FROM mysql.global_priv WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
+DELETE FROM mysql.user WHERE User='';
+DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
 DROP DATABASE IF EXISTS test;
 FLUSH PRIVILEGES;
 EOF
-
+    
+    echo -e "[client]\nuser=root\npassword=${db_root_pass}" > "$HOME/.my.cnf"
+    chmod 600 "$HOME/.my.cnf"
     success "MariaDB secured. Root credentials stored in ~/.my.cnf"
 }
 
