@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ##################################################################################
-# # WordPress Ultimate Operations (WOO) Toolkit - V7.2 (Logging Fix)               #
+# # WordPress Ultimate Operations (WOO) Toolkit - V7.3 (Resilient DB Security)     #
 # #                                                                                #
 # # This script provides a comprehensive, enterprise-grade solution for deploying  #
 # # and managing high-performance, secure, and completely isolated WordPress sites.#
@@ -221,16 +221,36 @@ secure_mysql() {
         warn "MariaDB appears to be already secured. Skipping."
         return
     fi
+
     local db_root_pass
     db_root_pass=$(openssl rand -base64 32)
-    sudo mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '${db_root_pass}';"
-    sudo mysql -e "DELETE FROM mysql.user WHERE User='';"
-    sudo mysql -e "DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');"
-    sudo mysql -e "DROP DATABASE IF EXISTS test;"
-    sudo mysql -e "FLUSH PRIVILEGES;"
+
+    log "Forcefully resetting MariaDB root password to a known secure value..."
+    sudo systemctl stop mariadb
+    sudo mysqld_safe --skip-grant-tables --skip-networking &
+    sleep 5
+
+    # Use a modern command for MariaDB 10.4+
+    sudo mysql -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '${db_root_pass}';"
+    sudo mysql -u root -e "FLUSH PRIVILEGES;"
+
+    sudo killall mysqld
+    sleep 5
+    sudo systemctl start mariadb
+
+    log "MariaDB root password has been reset."
     
     echo -e "[client]\nuser=root\npassword=${db_root_pass}" > "$HOME/.my.cnf"
     chmod 600 "$HOME/.my.cnf"
+    
+    log "Cleaning up anonymous users and test database..."
+    mysql --defaults-file="$HOME/.my.cnf" <<EOF
+DELETE FROM mysql.global_priv WHERE User='';
+DELETE FROM mysql.global_priv WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
+DROP DATABASE IF EXISTS test;
+FLUSH PRIVILEGES;
+EOF
+
     success "MariaDB secured. Root credentials stored in ~/.my.cnf"
 }
 
@@ -999,7 +1019,6 @@ check_user
 if [ ! -f "$HOME/.my.cnf" ]; then
     clear
     echo -e "${GREEN}--- Initial Server Setup for WOO Toolkit ---${NC}\n"
-    # This first call to `warn` will now work correctly
     warn "This appears to be the first run. The script will now set up and secure the server."
     read -p "Press Enter to begin the one-time setup..."
     
