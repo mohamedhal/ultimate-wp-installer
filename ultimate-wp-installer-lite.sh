@@ -1,21 +1,10 @@
 #!/bin/bash
 #
 # ##################################################################################
-# # WordPress Ultimate Operations (WOO) Toolkit - V7.5 (Authoritative DB Reset)    #
+# # WordPress Ultimate Operations (WOO) Toolkit - V7.6 (Systemd Override)          #
 # #                                                                                #
 # # This script provides a comprehensive, enterprise-grade solution for deploying  #
 # # and managing high-performance, secure, and completely isolated WordPress sites.#
-# #                                                                                #
-# # Key Features:                                                                  #
-# # ✅ Automated LEMP Stack (Nginx, MariaDB, PHP-FPM, Redis)                       #
-# # ✅ Advanced Security Hardening (UFW, Fail2Ban, IP Whitelisting)                #
-# # ✅ Full Lifecycle Management via the "woo" command                             #
-# # ✅ Standard & Multisite Installation Options                                   #
-# # ✅ Enterprise Backup Suite (On-Demand, Scheduled, Remote Off-site)             #
-# # ✅ One-Click Staging/Cloning Environments                                      #
-# # ✅ Automated Performance Tuning (MariaDB & PHP-FPM)                            #
-# # ✅ Secure XML-RPC Management for Odoo Integration                              #
-# # ✅ Integrated Debugging & Advanced Site Health Tools                           #
 # #                                                                                #
 # ##################################################################################
 
@@ -35,7 +24,6 @@ readonly LOG_FILE="${LOG_DIR}/woo-run-$(date +%Y%m%d_%H%M%S).log"
 # Centralized logging function to handle permissions
 _log() {
     local message="$1"
-    # Create directory and file with sudo, then chown to the running user
     if [ ! -d "$LOG_DIR" ]; then
         sudo mkdir -p "$LOG_DIR"
         sudo chown "$(whoami)":"$(whoami)" "$LOG_DIR"
@@ -43,7 +31,6 @@ _log() {
     if [ ! -f "$LOG_FILE" ]; then
         touch "$LOG_FILE"
     fi
-    # Append message to log file
     echo -e "$message" >> "$LOG_FILE"
 }
 
@@ -226,19 +213,21 @@ secure_mysql() {
     db_root_pass=$(openssl rand -base64 32)
 
     log "Forcefully resetting MariaDB root password..."
-    # Stop the service and kill any lingering processes
+    # Temporarily disable the service to prevent systemd from restarting it
     sudo systemctl stop mariadb
+    sudo systemctl disable mariadb
+    # Kill any lingering processes just in case
     sudo killall -KILL mysqld mysqld_safe > /dev/null 2>&1 || true
-    sleep 2
+    sleep 3
 
     # Start in safe mode and capture the PID
     sudo mysqld_safe --skip-grant-tables --skip-networking &
     local mysqld_pid=$!
+    log "Started mysqld in safe mode with PID $mysqld_pid"
     sleep 5
     
     # Create a temporary SQL file to avoid shell quoting issues
     local sql_file="/tmp/mysql-reset-$$.sql"
-    # The DEFINITIVE sequence to reset a password
     tee "$sql_file" >/dev/null <<EOF
 FLUSH PRIVILEGES;
 ALTER USER 'root'@'localhost' IDENTIFIED BY '${db_root_pass}';
@@ -246,14 +235,20 @@ FLUSH PRIVILEGES;
 EOF
 
     # Execute the commands
+    log "Executing password reset..."
     sudo mysql -u root < "$sql_file"
     
     # Clean up the temp file
     rm -f "$sql_file"
     
-    # Kill the specific safe-mode process and restart normally
+    # Kill the specific safe-mode process
+    log "Killing safe mode PID $mysqld_pid..."
     sudo kill -9 "$mysqld_pid"
-    sleep 5
+    sleep 3
+    
+    # Re-enable and restart the service normally
+    log "Re-enabling and restarting MariaDB service..."
+    sudo systemctl enable mariadb
     sudo systemctl start mariadb
 
     log "MariaDB root password has been reset."
