@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ##################################################################################
-# # WordPress Ultimate Operations (WOO) Toolkit - V7.8 (Resilient Service Detection) #
+# # WordPress Ultimate Operations (WOO) Toolkit - V8.0 (Final Version)             #
 # #                                                                                #
 # # This script provides a comprehensive, enterprise-grade solution for deploying  #
 # # and managing high-performance, secure, and completely isolated WordPress sites.#
@@ -211,17 +211,7 @@ secure_mysql() {
 
     local db_root_pass
     db_root_pass=$(openssl rand -base64 32)
-    
-    # Reliably detect the service name by checking for installed unit files
-    local service_name=""
-    if systemctl list-unit-files | grep -q "mariadb.service"; then
-        service_name="mariadb"
-    elif systemctl list-unit-files | grep -q "mysql.service"; then
-        service_name="mysql"
-    else
-        fail "Could not find mariadb.service or mysql.service. Cannot secure database."
-    fi
-    log "Detected database service: ${service_name}"
+    local service_name="mariadb" # Hardcode the service name as per user feedback
 
     log "Forcefully resetting MariaDB root password..."
     sudo systemctl stop "$service_name"
@@ -414,10 +404,6 @@ PHP
     success "Site '$domain' installed successfully!"
     SITE_DATA=()
 }
-
-# --- Main Execution Flow ---
-# NOTE: The rest of the functions (install_standard_site, remove_site, etc.) are unchanged.
-# They are omitted here for brevity but MUST be in your final script on GitHub.
 
 install_standard_site() {
     local domain=$1 site_dir=$2 admin_user=$3 admin_pass=$4
