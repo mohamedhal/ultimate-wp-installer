@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ##################################################################################
-# # WordPress Ultimate Operations (WOO) Toolkit - V8.3 (Socket Fix)                #
+# # WordPress Ultimate Operations (WOO) Toolkit - V8.4 (Final Version)             #
 # #                                                                                #
 # # This script provides a comprehensive, enterprise-grade solution for deploying  #
 # # and managing high-performance, secure, and completely isolated WordPress sites.#
@@ -232,8 +232,18 @@ secure_mysql() {
     sudo mysqld_safe --skip-grant-tables --skip-networking --socket="$temp_socket" &
     local mysqld_pid=$!
     log "Started mysqld in safe mode with PID $mysqld_pid on socket $temp_socket"
-    sleep 5
     
+    log "Waiting for temporary socket to become available..."
+    local counter=0
+    while [ ! -S "$temp_socket" ]; do
+        ((counter++))
+        if [ "$counter" -gt 30 ]; then # 30 second timeout
+            fail "Timed out waiting for the MariaDB safe mode socket."
+        fi
+        sleep 1
+    done
+    success "Temporary socket is active."
+
     local sql_file="/tmp/mysql-reset-$$.sql"
     tee "$sql_file" >/dev/null <<EOF
 FLUSH PRIVILEGES;
