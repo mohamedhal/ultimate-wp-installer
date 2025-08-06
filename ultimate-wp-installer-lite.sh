@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ##################################################################################
-# # WordPress Ultimate Operations (WOO) Toolkit - V7.0 (Zero-Fail Enterprise)      #
+# # WordPress Ultimate Operations (WOO) Toolkit - V7.1 (Zero-Fail Enterprise)      #
 # #                                                                                #
 # # This script provides a comprehensive, enterprise-grade solution for deploying  #
 # # and managing high-performance, secure, and completely isolated WordPress sites.#
@@ -24,7 +24,18 @@ set -eo pipefail
 trap 'error_handler $LINENO "$BASH_COMMAND"' ERR
 
 # --- Colors & Logging ---
-readonly RED='\033${NC} $1" | tee -a "$LOG_FILE"
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly NC='\033[0m'
+readonly LOG_FILE="/var/log/woo-toolkit-$(date +%Y%m%d_%H%M%S).log"
+
+log() {
+    # Ensure log file is writable
+    sudo touch "$LOG_FILE"
+    sudo chown "$(whoami)":"$(whoami)" "$LOG_FILE"
+    echo -e "${BLUE}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} $1" | tee -a "$LOG_FILE"
 }
 success() {
     echo -e "${GREEN}✓${NC} $1" | tee -a "$LOG_FILE"
@@ -57,68 +68,68 @@ error_handler() {
     local command=$2
     log "Critical error on line $line: \`$command\`. Initiating rollback..."
 
-    if}" ]]; then
-        log "Attempting to drop database: ${SITE_DATA}"
-        mysql --defaults-file="$HOME/.my.cnf" -e "DROP DATABASE IF EXISTS \`${SITE_DATA}\`;" >/dev/null 2>&1 |
-
-| true
-        log "Attempting to drop user: ${SITE_DATA}"
-        mysql --defaults-file="$HOME/.my.cnf" -e "DROP USER IF EXISTS '${SITE_DATA}'@'localhost';" >/dev/null 2>&1 |
-
-| true
+    if [[ -n "${SITE_DATA[DB_NAME]}" ]]; then
+        log "Attempting to drop database: ${SITE_DATA[DB_NAME]}"
+        mysql --defaults-file="$HOME/.my.cnf" -e "DROP DATABASE IF EXISTS \`${SITE_DATA[DB_NAME]}\`;" >/dev/null 2>&1 || true
+        log "Attempting to drop user: ${SITE_DATA[DB_USER]}"
+        mysql --defaults-file="$HOME/.my.cnf" -e "DROP USER IF EXISTS '${SITE_DATA[DB_USER]}'@'localhost';" >/dev/null 2>&1 || true
     fi
 
-    if}" ]]; then
-        log "Removing site directory: ${SITE_DATA}"
-        sudo rm -rf "${SITE_DATA}" >/dev/null 2>&1 |
-
-| true
+    if [[ -n "${SITE_DATA[SITE_DIR]}" ]]; then
+        log "Removing site directory: ${SITE_DATA[SITE_DIR]}"
+        sudo rm -rf "${SITE_DATA[SITE_DIR]}" >/dev/null 2>&1 || true
     fi
     
-    if}" ]]; then
-        log "Removing Nginx config for ${SITE_DATA}"
-        sudo rm -f "/etc/nginx/sites-available/${SITE_DATA}" "/etc/nginx/sites-enabled/${SITE_DATA}" >/dev/null 2>&1 |
-
-| true
+    if [[ -n "${SITE_DATA[DOMAIN]}" ]]; then
+        log "Removing Nginx config for ${SITE_DATA[DOMAIN]}"
+        sudo rm -f "/etc/nginx/sites-available/${SITE_DATA[DOMAIN]}" "/etc/nginx/sites-enabled/${SITE_DATA[DOMAIN]}" >/dev/null 2>&1 || true
     fi
 
     log "Restarting services to ensure stable state..."
-    sudo systemctl restart nginx mariadb php${PHP_VERSION}-fpm >/dev/null 2>&1 |
-
-| true
+    sudo systemctl restart nginx mariadb php${PHP_VERSION}-fpm >/dev/null 2>&1 || true
 
     fail "Installation failed. System has been rolled back. Check log for details: $LOG_FILE"
 }
 
 # --- Prerequisite and System Checks ---
-check_root() {
-    if]; then
-        fail "This script must not be run as root. Please run as a regular user with sudo privileges."
+check_user() {
+    if [ "$(id -u)" -eq 0 ]; then
+        warn "Running this script directly as root is not recommended."
+        warn "It's safer to run as a regular user with sudo privileges."
+        read -p "Press Enter to continue as root, or Ctrl+C to exit."
+    elif ! sudo -v >/dev/null 2>&1; then
+        fail "This script requires the ability to run commands with sudo. Please run as a user with sudo privileges."
     fi
 }
 
 analyze_system() {
     log "Analyzing system environment..."
-    if! grep -q "Ubuntu" /etc/os-release; then
+    if [ ! -f /etc/os-release ] || ! grep -q "Ubuntu" /etc/os-release; then
         fail "This script is optimized for Ubuntu LTS. Aborting."
     fi
-    local os_version=$(grep -oP '(?<=^VERSION_ID=").*(?=")' /etc/os-release)
+    
+    # Corrected and safer way to get OS version
+    local os_version
+    os_version=$(. /etc/os-release; echo "$VERSION_ID")
+    
     if (( $(echo "$os_version < 22.04" | bc -l) )); then
         warn "This script is tested on Ubuntu 22.04+. You are on ${os_version}. Proceed with caution."
     else
         success "Ubuntu ${os_version} detected."
     fi
 
-    local ram_mb=$(grep MemTotal /proc/meminfo | awk '{print int($2/1024)}')
+    local ram_mb
+    ram_mb=$(grep MemTotal /proc/meminfo | awk '{print int($2/1024)}')
     if (( ram_mb < MIN_RAM )); then
         warn "Low RAM detected (${ram_mb}MB). Creating 2GB swap file..."
-        sudo fallocate -l 2G /swapfile |
-
-| sudo dd if=/dev/zero of=/swapfile bs=1M count=2048
+        sudo fallocate -l 2G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=2048
         sudo chmod 600 /swapfile
         sudo mkswap /swapfile
         sudo swapon /swapfile
-        echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+        # Add to fstab only if it's not already there
+        if ! grep -q "/swapfile" /etc/fstab; then
+            echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+        fi
         success "Swap file created and enabled."
     else
         success "Sufficient RAM detected (${ram_mb}MB)."
@@ -129,7 +140,7 @@ analyze_system() {
 install_dependencies() {
     log "Updating package lists and installing core dependencies..."
     sudo apt-get update -y
-    sudo apt-get install -y software-properties-common curl wget unzip git rsync
+    sudo apt-get install -y software-properties-common curl wget unzip git rsync bc
     
     log "Adding Ondrej PPA for latest PHP and Nginx..."
     sudo add-apt-repository -y ppa:ondrej/php
@@ -146,7 +157,7 @@ install_dependencies() {
         redis-server fail2ban certbot python3-certbot-nginx \
         postfix unattended-upgrades haveged
     
-    if! command -v wp &>/dev/null; then
+    if ! command -v wp &>/dev/null; then
         log "Installing WP-CLI..."
         curl -sS -o /tmp/wp-cli.phar https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
         chmod +x /tmp/wp-cli.phar
@@ -162,7 +173,8 @@ install_dependencies() {
 
 configure_tuned_mariadb() {
     log "Tuning MariaDB for performance..."
-    local total_ram_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+    local total_ram_kb
+    total_ram_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
     local innodb_buffer_pool_size=$(( total_ram_kb / 4 )) # 25% of RAM
     
     # Cap at 4GB for smaller servers to avoid memory exhaustion
@@ -187,7 +199,8 @@ secure_mysql() {
         warn "MariaDB appears to be already secured. Skipping."
         return
     fi
-    local db_root_pass=$(openssl rand -base64 32)
+    local db_root_pass
+    db_root_pass=$(openssl rand -base64 32)
     sudo mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '${db_root_pass}';"
     sudo mysql -e "DELETE FROM mysql.user WHERE User='';"
     sudo mysql -e "DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');"
@@ -224,7 +237,7 @@ bantime = ${F2B_BANTIME}
 port = http,https
 EOF
     sudo tee /etc/fail2ban/filter.d/wordpress-hard.conf >/dev/null <<EOF
-
+[Definition]
 failregex = ^<HOST>.* "POST.*wp-login.php
 ignoreregex =
 EOF
@@ -235,7 +248,7 @@ EOF
     sudo sed -i 's/;cgi.fix_pathinfo=1/cgi.fix_pathinfo=0/' "/etc/php/${PHP_VERSION}/fpm/php.ini"
 
     log "Setting up XML-RPC IP Whitelist..."
-    if; then
+    if [ ! -f "$XMLRPC_WHITELIST_FILE" ]; then
         sudo tee "$XMLRPC_WHITELIST_FILE" >/dev/null <<EOF
 # This file is managed by the WOO Toolkit. Do not edit manually.
 # Whitelisted IPs for XML-RPC access.
@@ -250,12 +263,19 @@ EOF
 }
 
 setup_alias() {
-    if! grep -q "alias woo=" "$HOME/.bashrc"; then
-        warn "To run this toolkit easily, add the 'woo' alias to your shell."
-        echo -e "Run this command to set it up for your current user:"
-        echo -e "${YELLOW}echo \"alias woo='bash ${SCRIPT_PATH}'\" >> ~/.bashrc && source ~/.bashrc${NC}"
-        read -p "Press Enter to continue..."
+    # Setup alias in both root and user bashrc if possible
+    local bash_files=("$HOME/.bashrc")
+    if [ -f "/root/.bashrc" ]; then
+        bash_files+=("/root/.bashrc")
     fi
+
+    for bash_file in "${bash_files[@]}"; do
+        if ! grep -q "alias woo=" "$bash_file"; then
+            echo "Adding 'woo' alias to $bash_file..."
+            echo "alias woo='bash ${SCRIPT_PATH}'" | sudo tee -a "$bash_file" >/dev/null
+        fi
+    done
+    warn "Alias 'woo' has been set up. Please run 'source ~/.bashrc' or log out and log back in to use it."
 }
 
 # --- Site Management Functions ---
@@ -264,7 +284,7 @@ add_site() {
     
     local domain admin_user admin_pass site_type
     read -p "Enter domain name (e.g., mydomain.com): " domain
-    SITE_DATA="$domain"
+    SITE_DATA[DOMAIN]="$domain"
     
     read -p "Enter a secure admin username (do NOT use 'admin'): " admin_user
     admin_pass=$(openssl rand -base64 16)
@@ -278,7 +298,7 @@ add_site() {
     local table_prefix="wp_$(openssl rand -hex 3)_"
     local site_dir="${WEBROOT}/${domain}"
     
-    SITE_DATA="$db_name"; SITE_DATA="$db_user"; SITE_DATA="$site_dir"
+    SITE_DATA[DB_NAME]="$db_name"; SITE_DATA[DB_USER]="$db_user"; SITE_DATA[SITE_DIR]="$site_dir"
     
     log "Creating database '${db_name}' and user '${db_user}'..."
     mysql --defaults-file="$HOME/.my.cnf" <<EOF
@@ -327,7 +347,7 @@ PHP
     configure_nginx_site "$domain" "false" # Default to cache off
     
     log "Requesting Let's Encrypt SSL certificate..."
-    if! sudo certbot --nginx --hsts --uir --staple-ocsp -d "$domain" -d "www.$domain" --non-interactive --agree-tos -m "$ADMIN_EMAIL" --redirect; then
+    if ! sudo certbot --nginx --hsts --uir --staple-ocsp -d "$domain" -d "www.$domain" --non-interactive --agree-tos -m "$ADMIN_EMAIL" --redirect; then
         warn "SSL certificate request failed. Please check DNS records and run Certbot manually."
     fi
     sudo systemctl reload nginx
@@ -358,10 +378,10 @@ install_multisite() {
     
     if [[ "$network_type" == "1" ]]; then
         log "Checking for wildcard DNS record for *.$domain..."
-        if! dig +short "random-string-for-test.${domain}" | grep -qE "([0-9]{1,3}\.){3}[0-9]{1,3}"; then
+        if ! dig +short "random-string-for-test.${domain}" | grep -qE "([0-9]{1,3}\.){3}[0-9]{1,3}"; then
             warn "Wildcard DNS does not appear to be configured. Subdomain creation will likely fail."
             read -p "Continue anyway? (y/n): " -n 1 -r; echo
-           $ ]] && fail "Aborting Multisite installation."
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then fail "Aborting Multisite installation."; fi
         fi
         sudo -u www-data wp core multisite-install --path="$site_dir" --url="https://${domain}" --title="${domain}" --admin_user="${admin_user}" --admin_password="${admin_pass}" --admin_email="${ADMIN_EMAIL}" --subdomains
     else
@@ -376,20 +396,26 @@ install_multisite() {
 
 remove_site() {
     clear; echo -e "${RED}--- Remove WordPress Site ---${NC}\n"
-    local domain=$(select_site)
+    local domain
+    domain=$(select_site)
     [[ -z "$domain" ]] && return
     
     warn "This will PERMANENTLY delete all files, database, and configurations for ${domain}."
     read -p "Are you absolutely sure? (y/n): " -n 1 -r; echo
-   $ ]] && warn "Removal aborted." && return
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then warn "Removal aborted."; return; fi
     
     local site_dir="${WEBROOT}/${domain}"
-    local db_name=$(sudo -u www-data wp config get DB_NAME --path="$site_dir" --quiet |
-
-| echo "not_found")
-    local db_user=$(sudo -u www-data wp config get DB_USER --path="$site_dir" --quiet |
-
-| echo "not_found")
+    local db_name db_user
+    
+    # Robustly get DB details, even if WP-CLI fails
+    if [ -f "${site_dir}/wp-config.php" ]; then
+        db_name=$(grep "DB_NAME" "${site_dir}/wp-config.php" | cut -d \' -f 4)
+        db_user=$(grep "DB_USER" "${site_dir}/wp-config.php" | cut -d \' -f 4)
+    else
+        warn "wp-config.php not found for ${domain}. Cannot determine database details to drop."
+        db_name=""
+        db_user=""
+    fi
     
     log "Removing Nginx config for ${domain}..."
     sudo rm -f "/etc/nginx/sites-available/${domain}" "/etc/nginx/sites-enabled/${domain}"
@@ -397,8 +423,10 @@ remove_site() {
     log "Removing PHP-FPM pool for ${domain}..."
     sudo rm -f "/etc/php/${PHP_VERSION}/fpm/pool.d/${domain}.conf"
     
-    log "Dropping database '${db_name}' and user '${db_user}'..."
-    mysql --defaults-file="$HOME/.my.cnf" -e "DROP DATABASE IF EXISTS \`${db_name}\`; DROP USER IF EXISTS '${db_user}'@'localhost';"
+    if [[ -n "$db_name" && -n "$db_user" ]]; then
+        log "Dropping database '${db_name}' and user '${db_user}'..."
+        mysql --defaults-file="$HOME/.my.cnf" -e "DROP DATABASE IF EXISTS \`${db_name}\`; DROP USER IF EXISTS '${db_user}'@'localhost';"
+    fi
     
     log "Deleting site files from ${site_dir}..."
     sudo rm -rf "$site_dir"
@@ -450,7 +478,7 @@ set $skip_cache 0;
 if ($request_method = POST) {
     set $skip_cache 1;
 }
-if ($query_string!= "") {
+if ($query_string != "") {
     set $skip_cache 1;
 }
 # Don't cache URIs containing the following segments
@@ -558,7 +586,7 @@ server {
 }
 EOF
     
-    if [! -L "/etc/nginx/sites-enabled/${domain}" ]; then
+    if [ ! -L "/etc/nginx/sites-enabled/${domain}" ]; then
         sudo ln -s "$config_file" "/etc/nginx/sites-enabled/${domain}"
     fi
     sudo nginx -t && sudo systemctl reload nginx
@@ -567,13 +595,14 @@ EOF
 # --- Advanced Toolkit Functions ---
 list_sites() {
     clear; echo -e "${BLUE}--- Managed WordPress Sites ---${NC}\n"
-    if! ls -1 "${WEBROOT}" | grep -v 'html' | sed 's/^/ - /'; then
+    if ! ls -1 "${WEBROOT}" | grep -v 'html' | sed 's/^/ - /'; then
         warn "No sites found."
     fi
 }
 
 select_site() {
-    local sites=($(ls -1 "${WEBROOT}" | grep -v 'html'))
+    local sites
+    sites=($(ls -1 "${WEBROOT}" | grep -v 'html'))
     if [ ${#sites[@]} -eq 0 ]; then
         warn "No sites available to manage."
         return
@@ -592,7 +621,8 @@ select_site() {
 
 manage_caching() {
     clear; echo -e "${BLUE}--- Manage Site Caching ---${NC}\n"
-    local domain=$(select_site)
+    local domain
+    domain=$(select_site)
     [[ -z "$domain" ]] && return
     
     local nginx_conf="/etc/nginx/sites-available/${domain}"
@@ -601,14 +631,14 @@ manage_caching() {
     if grep -q "fastcgi_cache WORDPRESS;" "$nginx_conf"; then
         echo -e "${GREEN}ENABLED${NC}"
         read -p "Do you want to DISABLE caching? (y/n): " -n 1 -r; echo
-        if$ ]]; then
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
             configure_nginx_site "$domain" "false"
             success "Nginx FastCGI cache DISABLED for ${domain}."
         fi
     else
         echo -e "${RED}DISABLED${NC}"
         read -p "Do you want to ENABLE caching? (y/n): " -n 1 -r; echo
-        if$ ]]; then
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
             configure_nginx_site "$domain" "true"
             success "Nginx FastCGI cache ENABLED for ${domain}."
         fi
@@ -621,9 +651,7 @@ manage_xmlrpc() {
     
     while true; do
         echo -e "\nCurrent Whitelisted IPs:"
-        grep -E "^\s*([0-9]{1,3}\.){3}[0-9]{1,3}" "$XMLRPC_WHITELIST_FILE" | awk '{print " - " $1}' |
-
-| echo " - None"
+        grep -E "^\s*([0-9]{1,3}\.){3}[0-9]{1,3}" "$XMLRPC_WHITELIST_FILE" | awk '{print " - " $1}' || echo " - None"
         
         echo -e "\n1) Add IP to Whitelist"
         echo "2) Remove IP from Whitelist"
@@ -676,7 +704,8 @@ manage_backups() {
 }
 
 create_on_demand_backup() {
-    local domain=$(select_site)
+    local domain
+    domain=$(select_site)
     [[ -z "$domain" ]] && return
     
     log "Starting backup for ${domain}..."
@@ -684,11 +713,13 @@ create_on_demand_backup() {
     local backup_dir="$HOME/woo_backups/${domain}"
     mkdir -p "$backup_dir"
     
-    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local timestamp
+    timestamp=$(date +%Y%m%d_%H%M%S)
     local file_backup_path="${backup_dir}/files_${timestamp}.tar.gz"
     local db_backup_path="${backup_dir}/db_${timestamp}.sql"
     
-    local db_name=$(sudo -u www-data wp config get DB_NAME --path="$site_dir" --quiet)
+    local db_name
+    db_name=$(sudo -u www-data wp config get DB_NAME --path="$site_dir" --quiet)
     
     log "Backing up database '${db_name}'..."
     sudo -u www-data wp db export "$db_backup_path" --path="$site_dir"
@@ -705,7 +736,7 @@ configure_scheduled_backups() {
     clear; echo -e "${BLUE}--- Configure Scheduled Backups ---${NC}\n"
     
     read -p "Enable automated daily backups? (y/n): " -n 1 -r; echo
-    if$ ]]; then
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
         (crontab -l 2>/dev/null | grep -v "${SCRIPT_PATH} backup-all") | crontab -
         success "Scheduled backups disabled."
         return
@@ -713,7 +744,7 @@ configure_scheduled_backups() {
     
     mkdir -p "$CONFIG_DIR"
     read -p "Enable remote off-site backups via rsync/scp? (y/n): " -n 1 -r; echo
-    if$ ]]; then
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
         read -p "Enter remote user (e.g., user): " remote_user
         read -p "Enter remote host (e.g., backup.server.com): " remote_host
         read -p "Enter remote path (e.g., /home/user/backups/): " remote_path
@@ -732,18 +763,21 @@ configure_scheduled_backups() {
 
 backup_all_sites() {
     log "--- Starting All-Sites Scheduled Backup ---"
-    local sites=($(ls -1 "${WEBROOT}" | grep -v 'html'))
+    local sites
+    sites=($(ls -1 "${WEBROOT}" | grep -v 'html'))
     for domain in "${sites[@]}"; do
         log "Backing up ${domain}..."
         local site_dir="${WEBROOT}/${domain}"
         local backup_dir="$HOME/woo_backups/${domain}"
         mkdir -p "$backup_dir"
         
-        local timestamp=$(date +%Y%m%d)
+        local timestamp
+        timestamp=$(date +%Y%m%d)
         local backup_archive="${backup_dir}/full_backup_${timestamp}.tar.gz"
         local db_backup_path="/tmp/db_${domain}_${timestamp}.sql"
         
-        local db_name=$(sudo -u www-data wp config get DB_NAME --path="$site_dir" --quiet)
+        local db_name
+        db_name=$(sudo -u www-data wp config get DB_NAME --path="$site_dir" --quiet)
         
         sudo -u www-data wp db export "$db_backup_path" --path="$site_dir"
         sudo tar -czf "$backup_archive" -C "$WEBROOT" "$domain" -C /tmp "$(basename "$db_backup_path")"
@@ -751,7 +785,7 @@ backup_all_sites() {
         
         log "Backup for ${domain} created at ${backup_archive}"
         
-        if; then
+        if [ -f "$BACKUP_CONFIG_FILE" ]; then
             source "$BACKUP_CONFIG_FILE"
             log "Off-loading backup to ${REMOTE_HOST}..."
             rsync -a -e ssh "$backup_archive" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}"
@@ -765,7 +799,8 @@ backup_all_sites() {
 
 clone_to_staging() {
     clear; echo -e "${BLUE}--- Clone Site to Staging ---${NC}\n"
-    local domain=$(select_site)
+    local domain
+    domain=$(select_site)
     [[ -z "$domain" ]] && return
     
     local staging_domain="staging.${domain}"
@@ -775,7 +810,7 @@ clone_to_staging() {
     if [ -d "$staging_dir" ]; then
         warn "Staging site ${staging_domain} already exists."
         read -p "Delete existing staging site and re-clone? (y/n): " -n 1 -r; echo
-       $ ]] && warn "Cloning aborted." && return
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then warn "Cloning aborted."; return; fi
         bash "${SCRIPT_PATH}" remove-site-silent "$staging_domain"
     fi
     
@@ -783,10 +818,13 @@ clone_to_staging() {
     sudo cp -a "$site_dir" "$staging_dir"
     
     log "Cloning database..."
-    local db_name=$(sudo -u www-data wp config get DB_NAME --path="$site_dir" --quiet)
+    local db_name
+    db_name=$(sudo -u www-data wp config get DB_NAME --path="$site_dir" --quiet)
     local staging_db_name="${db_name}_staging"
-    local db_user=$(sudo -u www-data wp config get DB_USER --path="$site_dir" --quiet)
-    local db_pass=$(sudo -u www-data wp config get DB_PASS --path="$site_dir" --quiet)
+    local db_user
+    db_user=$(sudo -u www-data wp config get DB_USER --path="$site_dir" --quiet)
+    local db_pass
+    db_pass=$(sudo -u www-data wp config get DB_PASS --path="$site_dir" --quiet)
     
     mysql --defaults-file="$HOME/.my.cnf" -e "CREATE DATABASE \`${staging_db_name}\`;"
     mysqldump --defaults-file="$HOME/.my.cnf" "${db_name}" | mysql --defaults-file="$HOME/.my.cnf" "${staging_db_name}"
@@ -804,7 +842,7 @@ clone_to_staging() {
     configure_nginx_site "$staging_domain" "false"
     
     log "Requesting SSL for staging site..."
-    if! sudo certbot --nginx --hsts -d "$staging_domain" --non-interactive --agree-tos -m "$ADMIN_EMAIL" --redirect; then
+    if ! sudo certbot --nginx --hsts -d "$staging_domain" --non-interactive --agree-tos -m "$ADMIN_EMAIL" --redirect; then
         warn "SSL for staging failed. Check DNS for staging.${domain}."
     fi
     
@@ -816,7 +854,8 @@ clone_to_staging() {
 
 site_toolkit() {
     clear; echo -e "${BLUE}--- Site Toolkit (WP-CLI) ---${NC}\n"
-    local domain=$(select_site)
+    local domain
+    domain=$(select_site)
     [[ -z "$domain" ]] && return
     local site_dir="${WEBROOT}/${domain}"
     
@@ -843,15 +882,19 @@ site_toolkit() {
 
 manage_debugging() {
     clear; echo -e "${BLUE}--- Debugging Tools ---${NC}\n"
-    local domain=$(select_site)
+    local domain
+    domain=$(select_site)
     [[ -z "$domain" ]] && return
     local site_dir="${WEBROOT}/${domain}"
     
     while true; do
         echo -e "\nDebugging for: ${YELLOW}${domain}${NC}"
-        local debug_status=$(sudo -u www-data wp config get WP_DEBUG --path="$site_dir" --quiet && echo "ON" |
-
-| echo "OFF")
+        local debug_status
+        if sudo -u www-data wp config get WP_DEBUG --path="$site_dir" --quiet; then
+            debug_status="ON"
+        else
+            debug_status="OFF"
+        fi
         echo "WP_DEBUG is currently: ${debug_status}"
         echo "1) Toggle WP_DEBUG"
         echo "2) View Debug Log (tail -f)"
@@ -961,12 +1004,8 @@ fi
 if [[ "$1" == "remove-site-silent" && -n "$2" ]]; then
     domain=$2
     site_dir="${WEBROOT}/${domain}"
-    db_name=$(sudo -u www-data wp config get DB_NAME --path="$site_dir" --quiet |
-
-| echo "not_found")
-    db_user=$(sudo -u www-data wp config get DB_USER --path="$site_dir" --quiet |
-
-| echo "not_found")
+    db_name=$(grep "DB_NAME" "${site_dir}/wp-config.php" | cut -d \' -f 4)
+    db_user=$(grep "DB_USER" "${site_dir}/wp-config.php" | cut -d \' -f 4)
     sudo rm -f "/etc/nginx/sites-available/${domain}" "/etc/nginx/sites-enabled/${domain}"
     sudo rm -f "/etc/php/${PHP_VERSION}/fpm/pool.d/${domain}.conf"
     mysql --defaults-file="$HOME/.my.cnf" -e "DROP DATABASE IF EXISTS \`${db_name}\`; DROP USER IF EXISTS '${db_user}'@'localhost';"
@@ -975,9 +1014,9 @@ if [[ "$1" == "remove-site-silent" && -n "$2" ]]; then
     exit 0
 fi
 
-check_root
+check_user
 
-if [! -f "$HOME/.my.cnf" ]; then
+if [ ! -f "$HOME/.my.cnf" ]; then
     clear
     echo -e "${GREEN}--- Initial Server Setup for WOO Toolkit ---${NC}\n"
     warn "This appears to be the first run. The script will now set up and secure the server."
