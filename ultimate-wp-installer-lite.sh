@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ##################################################################################
-# # WordPress Ultimate Operations (WOO) Toolkit - V9.0 (Final Version)             #
+# # WordPress Ultimate Operations (WOO) Toolkit - V9.1 (Final Version)             #
 # #                                                                                #
 # # This script provides a comprehensive, enterprise-grade solution for deploying  #
 # # and managing high-performance, secure, and completely isolated WordPress sites.#
@@ -67,7 +67,6 @@ readonly MIN_RAM=2048
 readonly MIN_DISK=10240
 readonly F2B_MAXRETRY=5
 readonly F2B_BANTIME="1d"
-ADMIN_EMAIL=""
 declare -A SITE_DATA=()
 readonly SCRIPT_PATH="$(realpath "$0")"
 readonly CONFIG_DIR="$HOME/.woo-toolkit"
@@ -308,11 +307,12 @@ setup_alias() {
 add_site() {
     clear; echo -e "${GREEN}--- Add New WordPress Site ---${NC}\n"
     
-    local domain admin_user admin_pass site_type
+    local domain admin_user admin_email admin_pass site_type
     read -p "Enter domain name (e.g., mydomain.com): " domain
     SITE_DATA[DOMAIN]="$domain"
     
     read -p "Enter a secure admin username (do NOT use 'admin'): " admin_user
+    read -p "Enter the admin email address: " admin_email
     admin_pass=$(openssl rand -base64 16)
     
     read -p "Installation type? (1) Standard (2) Multisite: " site_type
@@ -338,14 +338,13 @@ EOF
     sudo chown -R www-data:www-data "$site_dir"
     
     log "Downloading WordPress core..."
-    sudo -u www-data wp core download --path="$site_dir" --locale=en_US
+    sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp core download --path="$site_dir" --locale=en_US
     
     log "Creating wp-config.php with security enhancements..."
-    sudo -u www-data wp config create --path="$site_dir" --dbname="${db_name}" --dbuser="${db_user}" --dbpass="${db_pass}" --dbprefix="${table_prefix}" --extra-php <<PHP
+    sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config create --path="$site_dir" --dbname="${db_name}" --dbuser="${db_user}" --dbpass="${db_pass}" --dbprefix="${table_prefix}" --extra-php <<PHP
+define('WP_CACHE', true);
 define('WP_REDIS_HOST', '127.0.0.1');
 define('WP_REDIS_PORT', 6379);
-define('WP_CACHE_KEY_SALT', '${domain}');
-define('WP_CACHE', true);
 define('FS_METHOD', 'direct');
 define('FORCE_SSL_ADMIN', true);
 define('DISALLOW_FILE_EDIT', true);
@@ -354,11 +353,12 @@ define('WP_DEBUG', false);
 define('WP_MEMORY_LIMIT', '128M');
 define('WP_MAX_MEMORY_LIMIT', '256M');
 PHP
+    sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set WP_CACHE_KEY_SALT "${domain}" --path="$site_dir" --raw
 
     if [[ "$site_type" == "2" ]]; then
-        install_multisite "$domain" "$site_dir" "$admin_user" "$admin_pass"
+        install_multisite "$domain" "$site_dir" "$admin_user" "$admin_pass" "$admin_email"
     else
-        install_standard_site "$domain" "$site_dir" "$admin_user" "$admin_pass"
+        install_standard_site "$domain" "$site_dir" "$admin_user" "$admin_pass" "$admin_email"
     fi
     
     log "Setting secure file permissions..."
@@ -370,7 +370,7 @@ PHP
     configure_nginx_site "$domain" "false"
     
     log "Requesting Let's Encrypt SSL certificate..."
-    if ! sudo certbot --nginx --hsts --uir --staple-ocsp -d "$domain" -d "www.$domain" --non-interactive --agree-tos -m "$ADMIN_EMAIL" --redirect; then
+    if ! sudo certbot --nginx --hsts --uir --staple-ocsp -d "$domain" -d "www.$domain" --non-interactive --agree-tos -m "$admin_email" --redirect; then
         warn "SSL certificate request failed. Please check DNS records and run Certbot manually."
     fi
     sudo systemctl reload nginx
@@ -381,20 +381,20 @@ PHP
 }
 
 install_standard_site() {
-    local domain=$1 site_dir=$2 admin_user=$3 admin_pass=$4
+    local domain=$1 site_dir=$2 admin_user=$3 admin_pass=$4 admin_email=$5
     log "Performing standard WordPress installation..."
-    sudo -u www-data wp core install --path="$site_dir" --url="https://${domain}" --title="${domain}" --admin_user="${admin_user}" --admin_password="${admin_pass}" --admin_email="${ADMIN_EMAIL}"
+    sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp core install --path="$site_dir" --url="https://${domain}" --title="${domain}" --admin_user="${admin_user}" --admin_password="${admin_pass}" --admin_email="${admin_email}"
     
     log "Installing recommended base plugins..."
-    sudo -u www-data wp plugin install redis-cache --activate --path="$site_dir"
-    sudo -u www-data wp redis enable --path="$site_dir"
+    sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp plugin install redis-cache --activate --path="$site_dir"
+    sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp redis enable --path="$site_dir"
 }
 
 install_multisite() {
-    local domain=$1 site_dir=$2 admin_user=$3 admin_pass=$4
+    local domain=$1 site_dir=$2 admin_user=$3 admin_pass=$4 admin_email=$5
     log "Performing WordPress Multisite installation..."
     
-    sudo -u www-data wp config set WP_ALLOW_MULTISITE true --raw --path="$site_dir"
+    sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set WP_ALLOW_MULTISITE true --raw --path="$site_dir"
     
     local network_type
     read -p "Multisite type? (1) Subdomain (e.g., site.domain.com) (2) Subdirectory (e.g., domain.com/site): " network_type
@@ -406,22 +406,21 @@ install_multisite() {
             read -p "Continue anyway? (y/n): " -n 1 -r; echo
             if [[ ! $REPLY =~ ^[Yy]$ ]]; then fail "Aborting Multisite installation."; fi
         fi
-        sudo -u www-data wp core multisite-install --path="$site_dir" --url="https://${domain}" --title="${domain}" --admin_user="${admin_user}" --admin_password="${admin_pass}" --admin_email="${ADMIN_EMAIL}" --subdomains
+        sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp core multisite-install --path="$site_dir" --url="https://${domain}" --title="${domain}" --admin_user="${admin_user}" --admin_password="${admin_pass}" --admin_email="${admin_email}" --subdomains
     else
-        sudo -u www-data wp core multisite-install --path="$site_dir" --url="https://${domain}" --title="${domain}" --admin_user="${admin_user}" --admin_password="${admin_pass}" --admin_email="${ADMIN_EMAIL}"
+        sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp core multisite-install --path="$site_dir" --url="https://${domain}" --title="${domain}" --admin_user="${admin_user}" --admin_password="${admin_pass}" --admin_email="${admin_email}"
     fi
     
     log "Installing recommended base plugins for Multisite..."
-    sudo -u www-data wp plugin install redis-cache --activate --network --path="$site_dir"
-    sudo -u www-data wp redis enable --path="$site_dir"
+    sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp plugin install redis-cache --activate --network --path="$site_dir"
+    sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp redis enable --path="$site_dir"
     success "Multisite network created. Please log in to complete any additional setup."
 }
 
 remove_site() {
     clear; echo -e "${RED}--- Remove WordPress Site ---${NC}\n"
     local domain
-    domain=$(select_site)
-    [[ -z "$domain" ]] && return
+    domain=$(select_site) || return
     
     warn "This will PERMANENTLY delete all files, database, and configurations for ${domain}."
     read -p "Are you absolutely sure? (y/n): " -n 1 -r; echo
@@ -509,8 +508,8 @@ EOF
     fi
     
     local multisite_rules=""
-    if sudo -u www-data wp core is-installed --network --path="${WEBROOT}/${domain}" >/dev/null 2>&1; then
-        if sudo -u www-data wp config get SUBDOMAIN_INSTALL --path="${WEBROOT}/${domain}" --quiet; then
+    if sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp core is-installed --network --path="${WEBROOT}/${domain}" >/dev/null 2>&1; then
+        if sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get SUBDOMAIN_INSTALL --path="${WEBROOT}/${domain}" --quiet; then
             multisite_rules="
 if (!-e \$request_filename) {
     rewrite /wp-admin\$ \$scheme://\$host\$uri/ permanent;
@@ -583,7 +582,7 @@ EOF
 
 list_sites() {
     clear; echo -e "${BLUE}--- Managed WordPress Sites ---${NC}\n"
-    if ! ls -1 "${WEBROOT}" | grep -v 'html' | sed 's/^/ - /'; then
+    if ! ls -1 "${WEBROOT}" | grep -v 'html' 2>/dev/null | sed 's/^/ - /'; then
         warn "No sites found."
     fi
 }
@@ -710,10 +709,10 @@ create_on_demand_backup() {
     local db_backup_path="${backup_dir}/db_${timestamp}.sql"
     
     local db_name
-    db_name=$(sudo -u www-data wp config get DB_NAME --path="$site_dir" --quiet)
+    db_name=$(sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get DB_NAME --path="$site_dir" --quiet)
     
     log "Backing up database '${db_name}'..."
-    sudo -u www-data wp db export "$db_backup_path" --path="$site_dir"
+    sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp db export "$db_backup_path" --path="$site_dir"
     
     log "Backing up files from ${site_dir}..."
     sudo tar -czf "$file_backup_path" -C "$WEBROOT" "$domain"
@@ -768,9 +767,9 @@ backup_all_sites() {
         local db_backup_path="/tmp/db_${domain}_${timestamp}.sql"
         
         local db_name
-        db_name=$(sudo -u www-data wp config get DB_NAME --path="$site_dir" --quiet)
+        db_name=$(sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get DB_NAME --path="$site_dir" --quiet)
         
-        sudo -u www-data wp db export "$db_backup_path" --path="$site_dir"
+        sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp db export "$db_backup_path" --path="$site_dir"
         sudo tar -czf "$backup_archive" -C "$WEBROOT" "$domain" -C /tmp "$(basename "$db_backup_path")"
         sudo rm "$db_backup_path"
         
@@ -809,17 +808,17 @@ clone_to_staging() {
     
     log "Cloning database..."
     local db_name
-    db_name=$(sudo -u www-data wp config get DB_NAME --path="$site_dir" --quiet)
+    db_name=$(sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get DB_NAME --path="$site_dir" --quiet)
     local staging_db_name="${db_name}_staging"
     
     mysql --defaults-file="$HOME/.my.cnf" -e "CREATE DATABASE \`${staging_db_name}\`;"
     mysqldump --defaults-file="$HOME/.my.cnf" "${db_name}" | mysql --defaults-file="$HOME/.my.cnf" "${staging_db_name}"
     
     log "Configuring staging site..."
-    sudo -u www-data wp config set DB_NAME "$staging_db_name" --path="$staging_dir"
+    sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set DB_NAME "$staging_db_name" --path="$staging_dir"
     
     log "Running search-replace on staging database..."
-    sudo -u www-data wp search-replace "https://${domain}" "https://${staging_domain}" --all-tables --path="$staging_dir"
+    sudo -u www-aata WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp search-replace "https://${domain}" "https://${staging_domain}" --all-tables --path="$staging_dir"
     
     log "Setting up server configuration for staging site..."
     create_php_pool "$staging_domain"
@@ -831,7 +830,7 @@ clone_to_staging() {
     fi
     
     log "Adding 'noindex' to staging site..."
-    sudo -u www-data wp option update blog_public 0 --path="$staging_dir"
+    sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp option update blog_public 0 --path="$staging_dir"
     
     success "Staging site created at https://${staging_domain}"
 }
@@ -853,10 +852,10 @@ site_toolkit() {
         read -p "Enter choice: " choice
         
         case "$choice" in
-            1) sudo -u www-data wp user list --path="$site_dir";;
-            2) sudo -u www-data wp db optimize --path="$site_dir";;
-            3) sudo -u www-data wp cron event list --path="$site_dir";;
-            4) sudo -u www-data wp site health check --format=json --path="$site_dir" | tee /tmp/health.json && cat /tmp/health.json;;
+            1) sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp user list --path="$site_dir";;
+            2) sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp db optimize --path="$site_dir";;
+            3) sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp cron event list --path="$site_dir";;
+            4) sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp site health check --format=json --path="$site_dir" | tee /tmp/health.json && cat /tmp/health.json;;
             5) break;;
             *) warn "Invalid choice.";;
         esac
@@ -874,7 +873,7 @@ manage_debugging() {
     while true; do
         echo -e "\nDebugging for: ${YELLOW}${domain}${NC}"
         local debug_status
-        if sudo -u www-data wp config get WP_DEBUG --path="$site_dir" --quiet; then
+        if sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get WP_DEBUG --path="$site_dir" --quiet; then
             debug_status="ON"
         else
             debug_status="OFF"
@@ -888,13 +887,13 @@ manage_debugging() {
         case "$choice" in
             1)
                 if [[ "$debug_status" == "ON" ]]; then
-                    sudo -u www-data wp config set WP_DEBUG false --raw --path="$site_dir"
-                    sudo -u www-data wp config set WP_DEBUG_LOG false --raw --path="$site_dir"
-                    sudo -u www-data wp config set WP_DEBUG_DISPLAY false --raw --path="$site_dir"
+                    sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set WP_DEBUG false --raw --path="$site_dir"
+                    sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set WP_DEBUG_LOG false --raw --path="$site_dir"
+                    sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set WP_DEBUG_DISPLAY false --raw --path="$site_dir"
                 else
-                    sudo -u www-data wp config set WP_DEBUG true --raw --path="$site_dir"
-                    sudo -u www-data wp config set WP_DEBUG_LOG true --raw --path="$site_dir"
-                    sudo -u www-data wp config set WP_DEBUG_DISPLAY false --raw --path="$site_dir"
+                    sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set WP_DEBUG true --raw --path="$site_dir"
+                    sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set WP_DEBUG_LOG true --raw --path="$site_dir"
+                    sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set WP_DEBUG_DISPLAY false --raw --path="$site_dir"
                 fi
                 success "Debug status toggled."
                 ;;
@@ -1022,8 +1021,6 @@ main() {
         harden_server
         
         echo -e "\n${GREEN}Initial server setup is complete!${NC}"
-        read -p "Enter a valid email address for SSL certificates and admin notifications: " ADMIN_EMAIL
-        setup_alias
     fi
 
     main_menu
