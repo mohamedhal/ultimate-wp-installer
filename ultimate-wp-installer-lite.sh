@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ##################################################################################
-# # WordPress Ultimate Operations (WOO) Toolkit - V9.3 (Final Version)             #
+# # WordPress Ultimate Operations (WOO) Toolkit - V9.3 (Final Polished Version)    #
 # #                                                                                #
 # # This script provides a comprehensive, enterprise-grade solution for deploying  #
 # # and managing high-performance, secure, and completely isolated WordPress sites.#
@@ -781,7 +781,7 @@ backup_all_sites() {
         local db_name
         db_name=$(sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get DB_NAME --path="$site_dir" --quiet)
         
-        sudo -u www-aata WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp db export "$db_backup_path" --path="$site_dir"
+        sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp db export "$db_backup_path" --path="$site_dir"
         sudo tar -czf "$backup_archive" -C "$WEBROOT" "$domain" -C /tmp "$(basename "$db_backup_path")"
         sudo rm "$db_backup_path"
         
