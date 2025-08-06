@@ -22,7 +22,8 @@ readonly PHP_VERSION="8.2"
 readonly WEBROOT="/var/www"
 readonly BACKUP_DIR="$HOME/wp-backups"
 readonly LOG_FILE="$HOME/wp-installer-$(date +%Y%m%d).log"
-readonly ADMIN_EMAIL="admin@$(hostname)"
+# ⚠️ IMPORTANT: Change this to a valid email address.
+readonly ADMIN_EMAIL="your-email@example.com"
 readonly MAX_RETRIES=3
 readonly MIN_RAM=2048   # 2GB in MB
 readonly MIN_DISK=10240 # 10GB in MB
@@ -243,7 +244,7 @@ create_php_pool() {
     local domain="$1"
     local pool_file="/etc/php/${PHP_VERSION}/fpm/pool.d/${domain}.conf"
     
-    local total_ram=$($INSTALL_SUDO free -m | awk '/Mem:/ {print int($2*0.5)"M"}')
+    local total_ram=$($INSTALL_SUDO free -m | awk '/Mem:/ {print int($2*0.5)"M"}' || echo "1G")
     local pm_max_children=$(( total_ram / 100 ))
     (( pm_max_children < 5 )) && pm_max_children=5
     
@@ -539,7 +540,7 @@ main() {
         domain=$(sanitize_domain "$raw_domain")
         if validate_domain "$domain"; then
             install_wordpress "$domain"
-            break # Exit the loop after one successful install
+            break
         else
             warn "Invalid domain: $domain"
         fi
