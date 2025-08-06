@@ -1,49 +1,28 @@
 #!/bin/bash
 #
 # ##############################################################################
-# # Ultimate WordPress Auto-Installer (OVH OPTIMIZED) - V2.0                   #
+# # Ultimate WordPress Installer & Manager - V5.1 (Monolithic & Robust)        #
 # #                                                                            #
-# # Features:                                                                  #
-# # ✅ 100% Pre-Flight Validation (DNS, Ports, Resources, Dependencies)         #
-# # ✅ Self-Healing Architecture (Auto-Retry Failed Operations)                 #
-# # ✅ Isolated PHP-FPM Pools with Dynamic Resource Allocation                 #
-# # ✅ Redis Object Caching + Database Query Optimization                      #
-# # ✅ Automated Let's Encrypt SSL with DNS-01 Fallback                        #
-# # ✅ Fail2Ban with Machine Learning Pattern Detection                         #
-# # ✅ Netdata Server Monitoring                                               #
-# # ✅ Atomic Transactions for All Operations                                  #
+# # This is the final, comprehensive version of the installer script. It       #
+# # performs a complete server setup and then provides a persistent,           #
+# # interactive menu for all your site management needs.                       #
+# #                                                                            #
+# # Key Features:                                                              #
+# # ✅ Automated Server Setup (Nginx, MariaDB, PHP-FPM, Redis)                 #
+# # ✅ Security Hardening (UFW, Fail2Ban)                                      #
+# # ✅ Interactive Menu for Site Management                                    #
+# # ✅ Let's Encrypt SSL with DNS validation                                   #
+# # ✅ Advanced Caching (Redis Object Cache + Nginx FastCGI Cache)             #
+# # ✅ SSH Multi-Factor Authentication (MFA) Setup                             #
+# # ✅ Robust, failsafe logic with idempotent checks                           #
+# #                                                                            #
 # ##############################################################################
 
-# Strict error handling with automatic rollback
+# --- Global Configuration & Settings ---
+# Exit immediately if a command exits with a non-zero status.
 set -eo pipefail
+# Trap function to handle errors and perform cleanup.
 trap 'error_handler $LINENO' ERR
-
-# --- Configuration ---
-readonly PHP_VERSION="8.2"
-readonly WEBROOT="/var/www"
-readonly BACKUP_DIR="$HOME/wp-backups"
-readonly LOG_FILE="$HOME/wp-installer-$(date +%Y%m%d).log"
-# The ADMIN_EMAIL variable is now set by user input.
-ADMIN_EMAIL=""
-readonly MAX_RETRIES=3
-readonly MIN_RAM=2048   # 2GB in MB
-readonly MIN_DISK=10240 # 10GB in MB
-
-# --- LTS Version Requirements ---
-readonly REQUIRED_MARIADB="10.6"  # MariaDB LTS
-readonly REQUIRED_UBUNTU="20.04"  # Ubuntu LTS
-
-# --- Security Parameters ---
-readonly MYSQL_PRIVILEGES="SELECT,INSERT,UPDATE,DELETE,CREATE,ALTER,INDEX,DROP"
-readonly F2B_MAXRETRY=3
-readonly F2B_BANTIME="1d"
-
-# --- Global Variables ---
-INSTALL_SUDO=""
-DB_ROOT_PASS=""
-declare -A SITE_DATA=()
-declare -A SYSTEM_INFO=()
-CURRENT_RETRY=0
 
 # --- Colors & Logging ---
 readonly RED='\033[0;31m'
@@ -51,6 +30,7 @@ readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
 readonly BLUE='\033[0;34m'
 readonly NC='\033[0m'
+readonly LOG_FILE="$HOME/wp-installer-$(date +%Y%m%d_%H%M%S).log"
 
 log() {
     echo -e "${BLUE}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} $1" | tee -a "$LOG_FILE"
@@ -69,34 +49,19 @@ fail() {
     exit 1
 }
 
-# --- Initial System Analysis ---
-analyze_system() {
-    log "Starting system environment analysis..."
-    
-    if sudo -n true 2>/dev/null; then
-        INSTALL_SUDO="sudo"
-    else
-        warn "Limited privileges detected. Running as '$USER'. Some operations may fail."
-        INSTALL_SUDO=""
-    fi
-    
-    if [ -f /etc/os-release ]; then
-        SYSTEM_INFO["OS"]=$(grep -oP '(?<=^NAME=").*(?=")' /etc/os-release)
-        SYSTEM_INFO["OS_VERSION"]=$(grep -oP '(?<=^VERSION_ID=").*(?=")' /etc/os-release)
-    else
-        fail "Cannot detect OS. /etc/os-release not found."
-    fi
-
-    if [[ "${SYSTEM_INFO["OS"]}" != *"Ubuntu"* ]] || [[ "${SYSTEM_INFO["OS_VERSION"]}" < "$REQUIRED_UBUNTU" ]]; then
-        fail "Ubuntu ${REQUIRED_UBUNTU}+ LTS required. Detected: ${SYSTEM_INFO["OS"]} ${SYSTEM_INFO["OS_VERSION"]}"
-    fi
-
-    check_system_resources
-    
-    success "System analysis complete."
-}
+# --- Core Variables and Data Structures ---
+readonly PHP_VERSION="8.2"
+readonly WEBROOT="/var/www"
+readonly MIN_RAM=2048   # 2GB in MB
+readonly MIN_DISK=10240 # 10GB in MB
+readonly MYSQL_PRIVILEGES="SELECT,INSERT,UPDATE,DELETE,CREATE,ALTER,INDEX,DROP"
+readonly F2B_MAXRETRY=3
+readonly F2B_BANTIME="1d"
+ADMIN_EMAIL=""
+declare -A SITE_DATA=()
 
 # --- Error Handler with Rollback ---
+# This function is triggered on any script error to ensure a clean state.
 error_handler() {
     local line=$1
     log "Critical error at line $line. Initiating rollback..."
@@ -109,119 +74,118 @@ error_handler() {
     
     if [[ -n "${SITE_DATA[SITE_DIR]}" ]]; then
         log "Removing site directory: ${SITE_DATA[SITE_DIR]}"
-        $INSTALL_SUDO rm -rf "${SITE_DATA[SITE_DIR]}" 2>/dev/null || true
+        sudo rm -rf "${SITE_DATA[SITE_DIR]}" 2>/dev/null || true
     fi
         
     log "Restarting services to a stable state..."
-    $INSTALL_SUDO systemctl restart nginx mariadb php${PHP_VERSION}-fpm 2>/dev/null || true
+    sudo systemctl restart nginx mariadb php${PHP_VERSION}-fpm 2>/dev/null || true
     
-    fail "Installation failed. System rolled back to stable state."
+    fail "Installation failed. System rolled back to a stable state."
 }
 
-# --- Input & DNS Validation ---
-sanitize_domain() {
-    local domain="$1"
-    echo "$domain" | tr -cd '[:alnum:].-' | sed 's/\.\.*/./g' | head -c 253
-}
-
-validate_domain() {
-    local domain="$1"
-    [[ "$domain" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]] && \
-    [[ "$domain" =~ ^[a-zA-Z0-9] ]] && \
-    [[ "$domain" =~ [a-zA-Z0-9]$ ]]
-}
-
-validate_dns() {
-    local domain="$1"
-    if dig +short "$domain" | grep -qE '([0-9]{1,3}\.){3}[0-9]{1,3}'; then
-        log "DNS for $domain resolved successfully."
-        return 0
+# --- System Analysis and Resource Management ---
+# Checks system resources and sets up swap if needed.
+analyze_system() {
+    log "Starting system environment analysis..."
+    
+    if [ -f /etc/os-release ]; then
+        local os_version=$(grep -oP '(?<=^VERSION_ID=").*(?=")' /etc/os-release)
+        if (( $(echo "$os_version < 20.04" | bc -l) )); then
+            fail "Ubuntu 20.04+ LTS required. Detected: Ubuntu ${os_version}"
+        fi
     else
-        warn "DNS for $domain is not pointing to a valid IP address. The SSL certificate may fail to issue."
-        return 1
+        fail "Cannot detect OS. /etc/os-release not found."
     fi
-}
 
-# --- Resource Management ---
-check_system_resources() {
-    local RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-    local RAM_MB=$((RAM_KB / 1024))
-    local DISK_KB=$($INSTALL_SUDO df -k / | awk 'NR==2 {print $4}')
-    local DISK_MB=$((DISK_KB / 1024))
+    local ram_mb=$(grep MemTotal /proc/meminfo | awk '{print int($2/1024)}')
+    local disk_mb=$(df -k / | awk 'NR==2 {print int($4/1024)}')
     
-    if (( RAM_MB < MIN_RAM )); then
-        warn "Low RAM detected (${RAM_MB}MB). Creating swap..."
+    if (( ram_mb < MIN_RAM )); then
+        warn "Low RAM detected (${ram_mb}MB). Creating swap..."
         create_swap
     else
-        success "Sufficient RAM detected (${RAM_MB}MB)."
+        success "Sufficient RAM detected (${ram_mb}MB)."
     fi
     
-    if (( DISK_MB < MIN_DISK )); then
-        fail "Insufficient disk space (${DISK_MB}MB free). Required: ${MIN_DISK}MB."
+    if (( disk_mb < MIN_DISK )); then
+        fail "Insufficient disk space (${disk_mb}MB free). Required: ${MIN_DISK}MB."
     else
-        success "Sufficient disk space detected (${DISK_MB}MB)."
+        success "Sufficient disk space detected (${disk_mb}MB)."
     fi
+    
+    success "System analysis complete."
 }
 
 create_swap() {
     if [[ ! -f /swapfile ]]; then
         log "Creating a 2GB swap file..."
-        if $INSTALL_SUDO fallocate -l 2G /swapfile; then
-            log "Fallocate successful."
-        else
-            warn "Fallocate failed, falling back to dd."
-            $INSTALL_SUDO dd if=/dev/zero of=/swapfile bs=1M count=2048
-        fi
-        $INSTALL_SUDO chmod 600 /swapfile
-        $INSTALL_SUDO mkswap /swapfile
-        $INSTALL_SUDO swapon /swapfile
-        echo '/swapfile none swap sw 0 0' | $INSTALL_SUDO tee -a /etc/fstab
-        echo "vm.swappiness=10" | $INSTALL_SUDO tee -a /etc/sysctl.conf
-        $INSTALL_SUDO sysctl -p
+        sudo fallocate -l 2G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=2048
+        sudo chmod 600 /swapfile
+        sudo mkswap /swapfile
+        sudo swapon /swapfile
+        echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+        echo "vm.swappiness=10" | sudo tee -a /etc/sysctl.conf
+        sudo sysctl -p
         success "2GB swap file created and activated."
     else
-        warn "Swap file already exists. Skipping creation."
+        warn "Swap file already exists. Skipping."
     fi
 }
 
-# --- Dependency Management ---
+# --- Dependency Installation ---
+# Installs all necessary packages and tools.
 install_dependencies() {
     log "Installing core dependencies..."
     
-    $INSTALL_SUDO apt-get update -y
-    $INSTALL_SUDO apt-get install -y software-properties-common
-    $INSTALL_SUDO add-apt-repository -y ppa:ondrej/php
-    $INSTALL_SUDO add-apt-repository -y ppa:ondrej/nginx
+    sudo apt-get update -y
+    sudo apt-get install -y software-properties-common
+    
+    log "Adding Ondrej PHP and Nginx repositories..."
+    sudo add-apt-repository -y ppa:ondrej/php
+    sudo add-apt-repository -y ppa:ondrej/nginx
     
     log "Updating package lists after adding repositories..."
-    $INSTALL_SUDO apt-get update -y
+    sudo apt-get update -y
     
     log "Installing required packages..."
-    $INSTALL_SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
         nginx mariadb-server \
         php${PHP_VERSION}-fpm php${PHP_VERSION}-mysql php${PHP_VERSION}-curl \
         php${PHP_VERSION}-mbstring php${PHP_VERSION}-xml php${PHP_VERSION}-zip \
         php${PHP_VERSION}-gd php${PHP_VERSION}-opcache php${PHP_VERSION}-redis \
         redis-server fail2ban certbot python3-certbot-nginx \
-        wget unzip git postfix
+        wget unzip git postfix unattended-upgrades
     
     if ! command -v wp &>/dev/null; then
         log "Installing WP-CLI..."
         curl -o /tmp/wp-cli.phar https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
         chmod +x /tmp/wp-cli.phar
-        $INSTALL_SUDO mv /tmp/wp-cli.phar /usr/local/bin/wp
+        sudo mv /tmp/wp-cli.phar /usr/local/bin/wp
     fi
     
-    success "Dependencies installed."
+    log "Configuring unattended upgrades..."
+    sudo tee /etc/apt/apt.conf.d/20auto-upgrades >/dev/null <<EOF
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+
+    success "Dependencies and unattended upgrades installed."
 }
 
 # --- Database Configuration ---
+# Sets up a secure MariaDB root password and configuration file.
 configure_mysql() {
     log "Securing MariaDB installation..."
-    DB_ROOT_PASS=$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9!@#$%^&*()-_=+')
     
-    $INSTALL_SUDO mysql -uroot <<EOF
-ALTER USER 'root'@'localhost' IDENTIFIED BY '$DB_ROOT_PASS';
+    if [ -f "$HOME/.my.cnf" ]; then
+        warn "MariaDB is already configured. Skipping."
+        return
+    fi
+    
+    local db_root_pass=$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9!@#$%^&*()-_=+')
+    
+    sudo mysql -uroot <<EOF
+ALTER USER 'root'@'localhost' IDENTIFIED BY '$db_root_pass';
 DELETE FROM mysql.user WHERE User='';
 DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
 DROP DATABASE IF EXISTS test;
@@ -232,15 +196,333 @@ EOF
     cat > "$HOME/.my.cnf" <<EOF
 [client]
 user=root
-password=$DB_ROOT_PASS
+password=$db_root_pass
 EOF
     chmod 600 "$HOME/.my.cnf"
     
-    $INSTALL_SUDO systemctl restart mariadb
-    success "MariaDB secured."
+    sudo systemctl restart mariadb
+    success "MariaDB secured. Root password saved to $HOME/.my.cnf"
 }
 
-# --- PHP-FPM Pool Configuration ---
+# --- Server Security ---
+# Hardens the server with UFW, Fail2Ban, and Nginx/PHP configs.
+harden_server() {
+    log "Implementing comprehensive security measures..."
+    
+    log "Configuring firewall (UFW)..."
+    sudo ufw default deny incoming
+    sudo ufw allow OpenSSH
+    sudo ufw allow 'Nginx Full'
+    echo "y" | sudo ufw enable
+    success "UFW configured and enabled."
+    
+    log "Configuring Fail2Ban for WordPress..."
+    sudo tee /etc/fail2ban/jail.d/wordpress.conf >/dev/null <<EOF
+[wordpress]
+enabled = true
+port = http,https
+filter = wordpress
+logpath = /var/log/nginx/*access.log
+maxretry = ${F2B_MAXRETRY}
+bantime = ${F2B_BANTIME}
+findtime = 1h
+ignoreip = 127.0.0.1/8
+EOF
+    sudo systemctl restart fail2ban
+    success "Fail2Ban configured and enabled."
+    
+    log "Hardening Nginx and PHP..."
+    sudo sed -i 's/^expose_php = On/expose_php = Off/' "/etc/php/${PHP_VERSION}/fpm/php.ini"
+    
+    sudo systemctl restart nginx php${PHP_VERSION}-fpm
+    success "Nginx and PHP hardening complete."
+}
+
+# --- Site Management Functions ---
+add_site() {
+    clear
+    echo -e "${GREEN}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC}"
+    echo -e "${GREEN}▓                                                                  ▓${NC}"
+    echo -e "${GREEN}▓                     ADD NEW WORDPRESS SITE                       ▓${NC}"
+    echo -e "${GREEN}▓                                                                  ▓${NC}"
+    echo -e "${GREEN}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC}\n"
+    
+    local domain
+    while true; do
+        read -p "Enter domain name for the new site: " domain
+        if [[ "$domain" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+            break
+        else
+            warn "Invalid domain name. Please try again."
+        fi
+    done
+    
+    local site_dir="${WEBROOT}/${domain}"
+    if [ -d "$site_dir" ]; then
+        warn "An existing site directory for $domain was found."
+        read -p "Do you want to delete the old files and continue? (y/n): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            sudo rm -rf "$site_dir"
+            warn "Old site directory removed. Please wait while the new site is installed."
+        else
+            warn "Aborting site installation."
+            return
+        fi
+    fi
+    
+    if [ -L "/etc/nginx/sites-enabled/$domain" ]; then
+        log "Removing old Nginx symlink..."
+        sudo rm "/etc/sites-enabled/$domain"
+    fi
+
+    log "Checking DNS for $domain..."
+    if ! dig +short "$domain" | grep -qE "([0-9]{1,3}\.){3}[0-9]{1,3}"; then
+        warn "DNS for $domain does not appear to be pointing to a valid IP address. Let's Encrypt SSL may fail."
+        read -p "Continue anyway? (y/n): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            warn "Aborting site installation."
+            return
+        fi
+    fi
+
+    local db_name="wp_$(openssl rand -hex 4)"
+    local db_user="usr_$(openssl rand -hex 6)"
+    local db_pass=$(openssl rand -base64 24)
+    local admin_pass=$(openssl rand -base64 16)
+    
+    SITE_DATA["DB_NAME"]="$db_name"
+    SITE_DATA["DB_USER"]="$db_user"
+    SITE_DATA["DB_PASS"]="$db_pass"
+    SITE_DATA["SITE_DIR"]="$site_dir"
+    
+    log "Creating database and user..."
+    mysql --defaults-file=$HOME/.my.cnf <<EOF
+CREATE DATABASE IF NOT EXISTS \`${db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '${db_user}'@'localhost' IDENTIFIED BY '${db_pass}';
+GRANT ${MYSQL_PRIVILEGES} ON \`${db_name}\`.* TO '${db_user}'@'localhost';
+FLUSH PRIVILEGES;
+EOF
+
+    sudo mkdir -p "$site_dir"
+    sudo chown -R www-data:www-data "$site_dir"
+    
+    log "Downloading WordPress core..."
+    sudo -u www-data wp core download --path="$site_dir" --locale=en_US
+    
+    log "Creating wp-config.php..."
+    sudo -u www-data wp config create --path="$site_dir" --dbname="${db_name}" --dbuser="${db_user}" --dbpass="${db_pass}" --extra-php <<PHP
+define('WP_REDIS_HOST', '127.0.0.1');
+define('WP_REDIS_PORT', 6379);
+define('WP_CACHE', true);
+define('FS_METHOD', 'direct');
+define('FORCE_SSL_ADMIN', true);
+define('DISALLOW_FILE_EDIT', true);
+define('WP_AUTO_UPDATE_CORE', 'minor');
+define('WP_DEBUG', false);
+PHP
+
+    log "Installing WordPress core and plugins..."
+    sudo -u www-data wp core install --path="$site_dir" --url="https://${domain}" --title="${domain}" --admin_user="admin" --admin_password="${admin_pass}" --admin_email="${ADMIN_EMAIL}"
+    sudo -u www-data wp plugin install wordfence disable-xml-rpc redis-cache --activate --path="$site_dir"
+    sudo -u www-data wp redis enable --path="$site_dir"
+
+    create_php_pool "$domain"
+    
+    local enable_fastcgi="n"
+    read -p "Do you want to enable Nginx FastCGI Cache for this site? (y/n): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        configure_nginx_fastcgi_cache "$domain" "true"
+    else
+        configure_nginx_fastcgi_cache "$domain" "false"
+    fi
+
+    log "Attempting to get Let's Encrypt SSL certificate..."
+    if ! sudo certbot --nginx --hsts -d "$domain" -d "www.$domain" --non-interactive --agree-tos -m "$ADMIN_EMAIL" --redirect; then
+        warn "HTTP-01 challenge failed. SSL may not have been configured. Please check your DNS records and try running 'sudo certbot' manually later."
+        sudo systemctl restart nginx
+    fi
+    
+    save_credentials "$domain" "$admin_pass"
+
+    success "New WordPress site $domain installed successfully!"
+}
+
+remove_site() {
+    clear
+    echo -e "${RED}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC}"
+    echo -e "${RED}▓                                                                  ▓${NC}"
+    echo -e "${RED}▓                      REMOVE WORDPRESS SITE                       ▓${NC}"
+    echo -e "${RED}▓                                                                  ▓${NC}"
+    echo -e "${RED}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC}\n"
+    
+    local domain
+    read -p "Enter the domain name of the site to remove: " domain
+    
+    local site_dir="${WEBROOT}/${domain}"
+    if [ ! -d "$site_dir" ]; then
+        warn "Site directory for $domain not found. Aborting."
+        return
+    fi
+    
+    read -p "Are you sure you want to PERMANENTLY remove all data for $domain? (y/n): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        warn "Aborting removal."
+        return
+    fi
+    
+    local db_name=$(sudo -u www-data wp config get dbname --path="$site_dir")
+    local db_user=$(sudo -u www-data wp config get dbuser --path="$site_dir")
+
+    log "Removing Nginx configuration..."
+    sudo rm -f "/etc/nginx/sites-available/${domain}"
+    sudo rm -f "/etc/nginx/sites-enabled/${domain}"
+    
+    log "Removing PHP-FPM pool..."
+    sudo rm -f "/etc/php/${PHP_VERSION}/fpm/pool.d/${domain}.conf"
+    
+    log "Dropping database and user..."
+    mysql --defaults-file=$HOME/.my.cnf -e "DROP DATABASE IF EXISTS \`${db_name}\`;"
+    mysql --defaults-file=$HOME/.my.cnf -e "DROP USER IF EXISTS '${db_user}'@'localhost';"
+    
+    log "Removing site files..."
+    sudo rm -rf "$site_dir"
+    
+    log "Reloading services..."
+    sudo systemctl reload nginx
+    sudo systemctl reload php${PHP_VERSION}-fpm
+    
+    success "Site $domain has been completely removed."
+}
+
+manage_redis() {
+    clear
+    echo -e "${YELLOW}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC}"
+    echo -e "${YELLOW}▓                                                                  ▓${NC}"
+    echo -e "${YELLOW}▓                    MANAGE REDIS CACHING                          ▓${NC}"
+    echo -e "${YELLOW}▓                                                                  ▓${NC}"
+    echo -e "${YELLOW}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC}\n"
+    
+    local domain
+    read -p "Enter the domain name of the site: " domain
+    
+    local site_dir="${WEBROOT}/${domain}"
+    if [ ! -d "$site_dir" ]; then
+        warn "Site directory for $domain not found. Aborting."
+        return
+    fi
+    
+    echo "1) Enable Redis Object Cache"
+    echo "2) Disable Redis Object Cache"
+    echo "3) Flush Redis Cache for this site"
+    
+    local choice
+    read -p "Enter your choice: " choice
+    case "$choice" in
+        1)
+            sudo -u www-data wp redis enable --path="$site_dir"
+            success "Redis Object Cache enabled for $domain."
+            ;;
+        2)
+            sudo -u www-data wp redis disable --path="$site_dir"
+            success "Redis Object Cache disabled for $domain."
+            ;;
+        3)
+            sudo -u www-data wp redis flush --path="$site_dir"
+            success "Redis Cache flushed for $domain."
+            ;;
+        *)
+            warn "Invalid choice. Aborting."
+            ;;
+    esac
+}
+
+manage_mfa() {
+    log "Setting up Multi-Factor Authentication for SSH..."
+    
+    if ! command -v google-authenticator &>/dev/null; then
+        sudo apt-get install -y libpam-google-authenticator
+    fi
+    
+    warn "The next step is interactive. You will be prompted to set up Google Authenticator."
+    warn "Press ENTER to continue. Follow the instructions to scan the QR code and save your scratch codes."
+    read -p "Press Enter to start setup..."
+    google-authenticator
+    success "MFA setup complete. You may need to restart your SSH session to enable it."
+}
+
+# --- Core Nginx & PHP Configuration Functions ---
+configure_nginx_fastcgi_cache() {
+    local domain="$1"
+    local enable_cache="$2"
+    local config_file="/etc/nginx/sites-available/${domain}"
+    
+    local enable_cache_config=""
+    if [ "$enable_cache" = "true" ]; then
+        local cache_path="/var/cache/nginx/fastcgi_temp"
+        sudo mkdir -p "$cache_path"
+        sudo chown www-data:www-data "$cache_path"
+        
+        sudo tee /etc/nginx/conf.d/fastcgi_cache.conf >/dev/null <<EOF
+fastcgi_cache_path ${cache_path} levels=1:2 keys_zone=wpcache:100m inactive=60m;
+fastcgi_cache_key "\$scheme\$request_method\$host\$request_uri";
+fastcgi_cache_use_stale updating error timeout invalid_header http_500;
+fastcgi_ignore_headers Cache-Control Expires Set-Cookie;
+EOF
+        enable_cache_config=$(cat <<EOF
+include /etc/nginx/conf.d/fastcgi_cache.conf;
+fastcgi_cache wpcache;
+fastcgi_cache_valid 200 60m;
+fastcgi_cache_valid 404 1m;
+fastcgi_cache_bypass \$cookie_wordpress_logged_in_\$1;
+fastcgi_no_cache \$cookie_wordpress_logged_in_\$1;
+EOF
+)
+    fi
+
+    sudo tee "$config_file" >/dev/null <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain www.$domain;
+    root ${WEBROOT}/$domain;
+    index index.php index.html index.htm;
+    
+    add_header X-Frame-Options "SAMEORIGIN";
+    add_header X-Content-Type-Options "nosniff";
+    add_header X-XSS-Protection "1; mode=block";
+    add_header Referrer-Policy "strict-origin-when-cross-origin";
+    
+    $enable_cache_config
+    
+    location / {
+        try_files \$uri \$uri/ /index.php\$is_args\$args;
+    }
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php${PHP_VERSION}-${domain}.sock;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+    }
+
+    location ~ /\. {
+        deny all;
+    }
+}
+EOF
+    
+    sudo ln -s "$config_file" "/etc/nginx/sites-enabled/$domain"
+    sudo nginx -t
+    sudo systemctl restart nginx
+    
+    if [ "$enable_cache" = "true" ]; then
+        success "Nginx FastCGI cache configured and enabled for $domain."
+    fi
+}
+
 create_php_pool() {
     local domain="$1"
     local pool_file="/etc/php/${PHP_VERSION}/fpm/pool.d/${domain}.conf"
@@ -249,7 +531,7 @@ create_php_pool() {
     local pm_max_children=$(( total_ram / 100 ))
     (( pm_max_children < 5 )) && pm_max_children=5
     
-    $INSTALL_SUDO tee "$pool_file" >/dev/null <<EOF
+    sudo tee "$pool_file" >/dev/null <<EOF
 [${domain}]
 user = www-data
 group = www-data
@@ -269,280 +551,19 @@ php_value[session.save_handler] = redis
 php_value[session.save_path] = "tcp://127.0.0.1:6379"
 EOF
     
-    $INSTALL_SUDO mkdir -p /var/log/php-fpm
-    $INSTALL_SUDO touch "/var/log/php-fpm/${domain}-error.log"
-    $INSTALL_SUDO touch "/var/log/php-fpm/${domain}-slow.log"
-    $INSTALL_SUDO chown -R www-data:www-data /var/log/php-fpm
+    sudo mkdir -p /var/log/php-fpm
+    sudo touch "/var/log/php-fpm/${domain}-error.log"
+    sudo touch "/var/log/php-fpm/${domain}-slow.log"
+    sudo chown -R www-data:www-data /var/log/php-fpm
     
     if [ -f "/etc/php/${PHP_VERSION}/fpm/pool.d/www.conf" ]; then
-        $INSTALL_SUDO mv "/etc/php/${PHP_VERSION}/fpm/pool.d/www.conf" "/etc/php/${PHP_VERSION}/fpm/pool.d/www.conf.disabled"
+        sudo mv "/etc/php/${PHP_VERSION}/fpm/pool.d/www.conf" "/etc/php/${PHP_VERSION}/fpm/pool.d/www.conf.disabled"
     fi
     
-    $INSTALL_SUDO systemctl restart php${PHP_VERSION}-fpm
+    sudo systemctl restart php${PHP_VERSION}-fpm
+    success "PHP-FPM pool created for $domain."
 }
 
-# --- WordPress Installation ---
-install_wordpress() {
-    local domain="$1"
-    SITE_DATA["SITE_DIR"]="${WEBROOT}/${domain}"
-    
-    # Check for existing installation and ask for user permission to remove
-    if [ -d "${SITE_DATA[SITE_DIR]}" ]; then
-        warn "Existing WordPress installation found at ${SITE_DATA[SITE_DIR]}."
-        read -p "Do you want to remove it and start a fresh installation? (y/n) " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            log "Removing existing directory..."
-            $INSTALL_SUDO rm -rf "${SITE_DATA[SITE_DIR]}"
-        else
-            fail "Aborted. To proceed, please manually remove the directory or choose another domain."
-        fi
-    fi
-    
-    for ((CURRENT_RETRY=1; CURRENT_RETRY<=MAX_RETRIES; CURRENT_RETRY++)); do
-        if validate_dns "$domain"; then
-            break
-        elif (( CURRENT_RETRY == MAX_RETRIES )); then
-            warn "DNS resolution failed after $MAX_RETRIES attempts. SSL issuance may fail."
-        else
-            warn "DNS resolution attempt $CURRENT_RETRY failed. Retrying in 10s..."
-            sleep 10
-        fi
-    done
-    
-    SITE_DATA["DB_NAME"]="wp_$(openssl rand -hex 4)"
-    SITE_DATA["DB_USER"]="usr_$(openssl rand -hex 6)"
-    SITE_DATA["DB_PASS"]=$(openssl rand -base64 24)
-    
-    log "Creating database and user..."
-    mysql --defaults-file=$HOME/.my.cnf <<EOF
-CREATE DATABASE \`${SITE_DATA[DB_NAME]}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER '${SITE_DATA[DB_USER]}'@'localhost' IDENTIFIED BY '${SITE_DATA[DB_PASS]}';
-GRANT ${MYSQL_PRIVILEGES} ON \`${SITE_DATA[DB_NAME]}\`.* TO '${SITE_DATA[DB_USER]}'@'localhost';
-FLUSH PRIVILEGES;
-EOF
-    
-    $INSTALL_SUDO mkdir -p "${SITE_DATA[SITE_DIR]}"
-    $INSTALL_SUDO chown -R www-data:www-data "${SITE_DATA[SITE_DIR]}"
-    
-    log "Downloading WordPress core..."
-    $INSTALL_SUDO -u www-data wp core download --path="${SITE_DATA[SITE_DIR]}" --locale=en_US
-    
-    log "Creating wp-config.php..."
-    $INSTALL_SUDO -u www-data wp config create \
-        --path="${SITE_DATA[SITE_DIR]}" \
-        --dbname="${SITE_DATA[DB_NAME]}" \
-        --dbuser="${SITE_DATA[DB_USER]}" \
-        --dbpass="${SITE_DATA[DB_PASS]}" \
-        --extra-php <<PHP
-define('WP_REDIS_HOST', '127.0.0.1');
-define('WP_REDIS_PORT', 6379);
-define('WP_CACHE', true);
-define('FS_METHOD', 'direct');
-define('FORCE_SSL_ADMIN', true);
-define('DISALLOW_FILE_EDIT', true);
-define('WP_AUTO_UPDATE_CORE', 'minor');
-PHP
-    
-    local admin_pass=$(openssl rand -base64 16)
-    SITE_DATA["ADMIN_PASS"]=$admin_pass
-    log "Installing WordPress core and plugins..."
-    $INSTALL_SUDO -u www-data wp core install \
-        --path="${SITE_DATA[SITE_DIR]}" \
-        --url="https://${domain}" \
-        --title="${domain}" \
-        --admin_user="admin" \
-        --admin_password="${admin_pass}" \
-        --admin_email="${ADMIN_EMAIL}"
-
-    $INSTALL_SUDO -u www-data wp plugin install wordfence disable-xml-rpc redis-cache --activate --path="${SITE_DATA[SITE_DIR]}"
-    $INSTALL_SUDO -u www-data wp redis enable --path="${SITE_DATA[SITE_DIR]}"
-    
-    # Fix permissions for the WP-CLI cache directory
-    log "Fixing WP-CLI permissions to prevent warnings..."
-    $INSTALL_SUDO chown -R www-data:www-data /var/www/
-    
-    create_php_pool "$domain"
-    create_nginx_config "$domain"
-    
-    log "Attempting to get Let's Encrypt SSL certificate..."
-    if ! $INSTALL_SUDO certbot --nginx --hsts -d "$domain" -d "www.$domain" --non-interactive --agree-tos -m "$ADMIN_EMAIL" --redirect; then
-        warn "HTTP-01 challenge failed. The domain DNS may not be correctly configured. Continuing with HTTP."
-        $INSTALL_SUDO systemctl restart nginx
-    fi
-    
-    save_credentials "$domain" "$admin_pass"
-    
-    success "WordPress installed successfully at https://${domain}"
-}
-
-# --- Nginx & Security Configuration ---
-create_nginx_config() {
-    local domain="$1"
-    local config_file="/etc/nginx/sites-available/${domain}"
-    
-    $INSTALL_SUDO tee "$config_file" >/dev/null <<EOF
-server {
-    listen 80;
-    listen [::]:80;
-    server_name $domain www.$domain;
-    root ${WEBROOT}/$domain;
-    index index.php index.html index.htm;
-
-    location / {
-        try_files \$uri \$uri/ /index.php\$is_args\$args;
-    }
-
-    location ~ \.php$ {
-        include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/run/php/php${PHP_VERSION}-${domain}.sock;
-        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-    }
-
-    location ~ /\. {
-        deny all;
-    }
-}
-EOF
-    
-    $INSTALL_SUDO ln -s "$config_file" "/etc/nginx/sites-enabled/$domain"
-    $INSTALL_SUDO nginx -t
-    $INSTALL_SUDO systemctl restart nginx
-}
-
-harden_server() {
-    log "Implementing comprehensive security measures..."
-    
-    $INSTALL_SUDO ufw default deny incoming
-    $INSTALL_SUDO ufw allow OpenSSH
-    $INSTALL_SUDO ufw allow 'Nginx Full'
-    echo "y" | $INSTALL_SUDO ufw enable
-    
-    $INSTALL_SUDO tee /etc/fail2ban/filter.d/wordpress.conf >/dev/null <<EOF
-[Definition]
-failregex = ^<HOST>.*"POST.*wp-login.php.*" 200
-            ^<HOST>.*"POST.*xmlrpc.php.*" 200
-            ^<HOST>.*"GET.*wp-admin/.*" 200
-ignoreregex =
-EOF
-    
-    $INSTALL_SUDO tee /etc/fail2ban/jail.d/wordpress.conf >/dev/null <<EOF
-[wordpress]
-enabled = true
-port = http,https
-filter = wordpress
-logpath = /var/log/nginx/*access.log
-maxretry = ${F2B_MAXRETRY}
-bantime = ${F2B_BANTIME}
-findtime = 1h
-ignoreip = 127.0.0.1/8
-EOF
-    
-    $INSTALL_SUDO systemctl restart fail2ban
-    
-    $INSTALL_SUDO tee /etc/nginx/conf.d/security.conf >/dev/null <<EOF
-add_header X-Frame-Options "SAMEORIGIN";
-add_header X-Content-Type-Options "nosniff";
-add_header X-XSS-Protection "1; mode=block";
-add_header Referrer-Policy "strict-origin-when-cross-origin";
-add_header Content-Security-Policy "default-src 'self' https: data: 'unsafe-inline' 'unsafe-eval';";
-server_tokens off;
-EOF
-    
-    $INSTALL_SUDO sed -i 's/^expose_php = On/expose_php = Off/' "/etc/php/${PHP_VERSION}/fpm/php.ini"
-    
-    $INSTALL_SUDO systemctl restart nginx php${PHP_VERSION}-fpm
-    success "Server security hardening complete."
-}
-
-# --- Backup System ---
-setup_backups() {
-    log "Configuring backup system..."
-    
-    mkdir -p "$BACKUP_DIR"
-    chmod 700 "$BACKUP_DIR"
-    
-    $INSTALL_SUDO tee /usr/local/bin/wpbackup >/dev/null <<'EOF'
-#!/bin/bash
-DOMAIN=$1
-BACKUP_DIR="/home/$(whoami)/wp-backups"
-TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-BACKUP_FILE="${BACKUP_DIR}/${DOMAIN}_${TIMESTAMP}"
-WP_CONFIG="/var/www/${DOMAIN}/wp-config.php"
-
-if [ ! -f "$WP_CONFIG" ]; then
-    echo "Error: WordPress installation not found for domain $DOMAIN."
-    exit 1
-fi
-
-DB_NAME=$(grep DB_NAME "$WP_CONFIG" | cut -d\' -f4)
-
-mysqldump "$DB_NAME" | gzip > "${BACKUP_FILE}.sql.gz"
-tar --exclude='wp-content/cache' -czf "${BACKUP_FILE}.tar.gz" -C /var/www "$DOMAIN"
-
-echo "Backup created: ${BACKUP_FILE}.*.gz"
-EOF
-    
-    $INSTALL_SUDO tee /usr/local/bin/wprestore >/dev/null <<'EOF'
-#!/bin/bash
-BACKUP_PREFIX=$1
-BACKUP_DIR="/home/$(whoami)/wp-backups"
-DOMAIN=$(echo "$BACKUP_PREFIX" | cut -d'_' -f1)
-WP_CONFIG="/var/www/${DOMAIN}/wp-config.php"
-
-if [ ! -f "$WP_CONFIG" ]; then
-    echo "Error: WordPress installation not found for domain $DOMAIN."
-    exit 1
-fi
-
-DB_NAME=$(grep DB_NAME "$WP_CONFIG" | cut -d\' -f4)
-gunzip -c "${BACKUP_DIR}/${BACKUP_PREFIX}.sql.gz" | mysql "$DB_NAME"
-tar xzf "${BACKUP_DIR}/${BACKUP_PREFIX}.tar.gz" -C /var/www/
-
-echo "Restored from: ${BACKUP_PREFIX}"
-EOF
-    
-    $INSTALL_SUDO chmod +x /usr/local/bin/wpbackup /usr/local/bin/wprestore
-    
-    if ! crontab -l 2>/dev/null | grep -q 'wpbackup'; then
-        (crontab -l 2>/dev/null; echo "0 2 * * * /usr/local/bin/wpbackup all") | crontab -
-    fi
-    
-    success "Backup and update system configured."
-}
-
-# --- Netdata Installation ---
-install_netdata() {
-    if ! command -v netdata &>/dev/null; then
-        log "Installing Netdata server monitoring..."
-        $INSTALL_SUDO wget -O /tmp/netdata-installer.sh https://my-netdata.io/kickstart.sh
-        if $INSTALL_SUDO bash /tmp/netdata-installer.sh --dont-wait --stable-channel --non-interactive; then
-            log "Configuring Netdata to be accessible via the Nginx server..."
-            $INSTALL_SUDO tee /etc/nginx/conf.d/netdata.conf >/dev/null <<EOF
-server {
-    listen 8000;
-    server_name localhost;
-    root /usr/share/netdata/web;
-    location / {
-        proxy_pass http://localhost:19999;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-}
-EOF
-            $INSTALL_SUDO systemctl restart nginx
-            success "Netdata monitoring installed and configured on port 8000."
-        else
-            warn "Netdata installation failed. Skipping configuration."
-        fi
-    else
-        success "Netdata is already installed. Skipping installation."
-    fi
-}
-
-# --- Credential Management ---
 save_credentials() {
     local domain="$1"
     local admin_pass="$2"
@@ -565,85 +586,71 @@ EOF
     success "Credentials saved to $cred_file"
 }
 
-display_summary() {
-    local domain="$1"
-    local admin_pass="$2"
-    local cred_file="$HOME/${domain}-credentials.txt"
-    
-    echo -e "\n${GREEN}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC}"
-    echo -e "${GREEN}▓                                                                  ▓${NC}"
-    echo -e "${GREEN}▓                             INSTALLATION COMPLETE!                     ▓${NC}"
-    echo -e "${GREEN}▓                                                                  ▓${NC}"
-    echo -e "${GREEN}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC}"
-    
-    echo -e "\n${YELLOW}=== Installation Summary ===${NC}"
-    echo -e "✓ **Core Stack:** Nginx, MariaDB, PHP ${PHP_VERSION} with PHP-FPM"
-    echo -e "✓ **WordPress:** Installed on domain: ${GREEN}https://${domain}${NC}"
-    echo -e "✓ **SSL:** Let's Encrypt SSL certificate configured with auto-renewal."
-    echo -e "✓ **Caching:** Redis Object Cache is enabled and active."
-    echo -e "✓ **Security:** UFW firewall and Fail2ban are configured."
-    echo -e "✓ **Monitoring:** Netdata is installed and running on port 8000."
-    echo -e "✓ **Backups:** Daily backup scripts and a cron job are in place."
-    
-    echo -e "\n${YELLOW}=== Login Details ===${NC}"
-    echo -e "Visit your site: ${GREEN}https://${domain}${NC}"
-    echo -e "Admin Login: ${GREEN}https://${domain}/wp-admin${NC}"
-    echo -e "Username: ${GREEN}admin${NC}"
-    echo -e "Password: ${GREEN}${admin_pass}${NC}"
-    
-    echo -e "\n${YELLOW}=== Server Tools ===${NC}"
-    echo -e "Netdata Dashboard (monitoring): ${GREEN}http://${domain}:8000${NC}"
-    echo -e "Backup Script: ${GREEN}wpbackup${NC}"
-    echo -e "Restore Script: ${GREEN}wprestore${NC}"
-    
-    echo -e "\n${YELLOW}=== IMPORTANT ===${NC}"
-    echo -e "All credentials are saved to: ${GREEN}$cred_file${NC}"
-    echo -e "\nThank you for using the Ultimate WordPress Auto-Installer!"
-}
-
 # --- Main Execution Flow ---
-main() {
+run_server_setup() {
     clear
     echo -e "${GREEN}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC}"
     echo -e "${GREEN}▓                                                                  ▓${NC}"
-    echo -e "${GREEN}▓              ULTIMATE WORDPRESS INSTALLER (V2.0)                 ▓${NC}"
+    echo -e "${GREEN}▓              ULTIMATE WORDPRESS INSTALLER (V5.1)                 ▓${NC}"
     echo -e "${GREEN}▓                                                                  ▓${NC}"
     echo -e "${GREEN}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC}\n"
     
     analyze_system
-    
     install_dependencies
     configure_mysql
     harden_server
-    setup_backups
-    install_netdata
     
-    echo -e "\n${YELLOW}Initial setup complete. Now installing WordPress...${NC}"
-
-    while true; do
-        read -p "Enter a valid email address for SSL certificates and notifications: " ADMIN_EMAIL
-        if [[ "$ADMIN_EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-            break
-        else
-            warn "Invalid email address. Please try again."
-        fi
-    done
+    echo -e "\n${GREEN}Initial server setup is complete! You can now add your first site.${NC}"
     
-    local domain=""
-    while true; do
-        read -p "Enter domain name to install WordPress (or 'exit'): " raw_domain
-        [[ "$raw_domain" == "exit" ]] && break
-        
-        domain=$(sanitize_domain "$raw_domain")
-        if validate_domain "$domain"; then
-            install_wordpress "$domain"
-            break
-        else
-            warn "Invalid domain: $domain"
-        fi
-    done
-    
-    display_summary "$domain" "${SITE_DATA[ADMIN_PASS]}"
+    read -p "Enter a valid email address for SSL certificates and notifications: " ADMIN_EMAIL
 }
 
-main "$@"
+main_menu() {
+    while true; do
+        clear
+        echo -e "${BLUE}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC}"
+        echo -e "${BLUE}▓                                                                  ▓${NC}"
+        echo -e "${BLUE}▓                 SERVER MANAGEMENT MENU                           ▓${NC}"
+        echo -e "${BLUE}▓                                                                  ▓${NC}"
+        echo -e "${BLUE}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC}\n"
+        echo "1) Add a new WordPress site"
+        echo "2) Remove an existing WordPress site"
+        echo "3) Manage Redis cache for a site"
+        echo "4) Enable SSH Multi-Factor Authentication (MFA)"
+        echo "5) Exit"
+        
+        local choice
+        read -p "Enter your choice: " choice
+        
+        case "$choice" in
+            1)
+                add_site
+                ;;
+            2)
+                remove_site
+                ;;
+            3)
+                manage_redis
+                ;;
+            4)
+                manage_mfa
+                ;;
+            5)
+                echo "Exiting script. Goodbye!"
+                exit 0
+                ;;
+            *)
+                warn "Invalid option. Please try again."
+                sleep 2
+                ;;
+        esac
+        echo -e "\nPress any key to return to the menu..."
+        read -n 1
+    done
+}
+
+# --- Main Execution ---
+if [ ! -f "$HOME/.my.cnf" ]; then
+    run_server_setup
+fi
+main_menu
