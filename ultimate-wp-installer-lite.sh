@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ##################################################################################
-# # WordPress Ultimate Operations (WOO) Toolkit - V9.1 (Final Version)             #
+# # WordPress Ultimate Operations (WOO) Toolkit - V9.2 (Final Version)             #
 # #                                                                                #
 # # This script provides a comprehensive, enterprise-grade solution for deploying  #
 # # and managing high-performance, secure, and completely isolated WordPress sites.#
@@ -317,11 +317,23 @@ add_site() {
     
     read -p "Installation type? (1) Standard (2) Multisite: " site_type
     
+    local site_dir="${WEBROOT}/${domain}"
+    if [ -d "$site_dir" ]; then
+        warn "A directory for ${domain} already exists."
+        read -p "Do you want to delete the old directory and start over? [y/N]: " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            log "Deleting old directory: ${site_dir}"
+            sudo rm -rf "$site_dir"
+        else
+            fail "Installation aborted by user."
+        fi
+    fi
+
     local db_name="wp_$(echo "$domain" | tr '.' '_' | cut -c 1-20)_$(openssl rand -hex 4)"
     local db_user="usr_$(openssl rand -hex 6)"
     local db_pass=$(openssl rand -base64 24)
     local table_prefix="wp_$(openssl rand -hex 3)_"
-    local site_dir="${WEBROOT}/${domain}"
     
     SITE_DATA[DB_NAME]="$db_name"; SITE_DATA[DB_USER]="$db_user"; SITE_DATA[SITE_DIR]="$site_dir"
     
@@ -353,7 +365,7 @@ define('WP_DEBUG', false);
 define('WP_MEMORY_LIMIT', '128M');
 define('WP_MAX_MEMORY_LIMIT', '256M');
 PHP
-    sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set WP_CACHE_KEY_SALT "${domain}" --path="$site_dir" --raw
+    sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set WP_CACHE_KEY_SALT "'${domain}'" --path="$site_dir" --raw
 
     if [[ "$site_type" == "2" ]]; then
         install_multisite "$domain" "$site_dir" "$admin_user" "$admin_pass" "$admin_email"
@@ -818,14 +830,14 @@ clone_to_staging() {
     sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set DB_NAME "$staging_db_name" --path="$staging_dir"
     
     log "Running search-replace on staging database..."
-    sudo -u www-aata WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp search-replace "https://${domain}" "https://${staging_domain}" --all-tables --path="$staging_dir"
+    sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp search-replace "https://${domain}" "https://${staging_domain}" --all-tables --path="$staging_dir"
     
     log "Setting up server configuration for staging site..."
     create_php_pool "$staging_domain"
     configure_nginx_site "$staging_domain" "false"
     
     log "Requesting SSL for staging site..."
-    if ! sudo certbot --nginx --hsts -d "$staging_domain" --non-interactive --agree-tos -m "$ADMIN_EMAIL" --redirect; then
+    if ! sudo certbot --nginx --hsts -d "$staging_domain" --non-interactive --agree-tos -m "$admin_email" --redirect; then
         warn "SSL for staging failed. Check DNS for staging.${domain}."
     fi
     
