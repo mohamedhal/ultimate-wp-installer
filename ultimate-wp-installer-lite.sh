@@ -231,7 +231,8 @@ install_dependencies() {
     $INSTALL_SUDO apt-get update -y
     $INSTALL_SUDO apt-get install -y software-properties-common
     $INSTALL_SUDO add-apt-repository -y ppa:ondrej/php
-    $INSTALL_SUDO add-apt-repository -y ppa:ondrej/nginx-mainline
+    # FIX: Corrected Nginx PPA name
+    $INSTALL_SUDO add-apt-repository -y ppa:ondrej/nginx
     
     # Install packages
     $INSTALL_SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y \
