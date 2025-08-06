@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ##################################################################################
-# # WordPress Ultimate Operations (WOO) Toolkit - V7.1 (Zero-Fail Enterprise)      #
+# # WordPress Ultimate Operations (WOO) Toolkit - V7.2 (Logging Fix)               #
 # #                                                                                #
 # # This script provides a comprehensive, enterprise-grade solution for deploying  #
 # # and managing high-performance, secure, and completely isolated WordPress sites.#
@@ -29,22 +29,47 @@ readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
 readonly BLUE='\033[0;34m'
 readonly NC='\033[0m'
-readonly LOG_FILE="/var/log/woo-toolkit-$(date +%Y%m%d_%H%M%S).log"
+readonly LOG_DIR="/var/log/woo-toolkit"
+readonly LOG_FILE="${LOG_DIR}/woo-run-$(date +%Y%m%d_%H%M%S).log"
+
+# Centralized logging function to handle permissions
+_log() {
+    local message="$1"
+    # Create directory and file with sudo, then chown to the running user
+    if [ ! -d "$LOG_DIR" ]; then
+        sudo mkdir -p "$LOG_DIR"
+        sudo chown "$(whoami)":"$(whoami)" "$LOG_DIR"
+    fi
+    if [ ! -f "$LOG_FILE" ]; then
+        touch "$LOG_FILE"
+    fi
+    # Append message to log file
+    echo -e "$message" >> "$LOG_FILE"
+}
 
 log() {
-    # Ensure log file is writable
-    sudo touch "$LOG_FILE"
-    sudo chown "$(whoami)":"$(whoami)" "$LOG_FILE"
-    echo -e "${BLUE}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} $1" | tee -a "$LOG_FILE"
+    local formatted_message="${BLUE}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} $1"
+    local plain_message="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo -e "$formatted_message"
+    _log "$plain_message"
 }
 success() {
-    echo -e "${GREEN}✓${NC} $1" | tee -a "$LOG_FILE"
+    local formatted_message="${GREEN}✓${NC} $1"
+    local plain_message="✓ $1"
+    echo -e "$formatted_message"
+    _log "$plain_message"
 }
 warn() {
-    echo -e "${YELLOW}‼${NC} $1" | tee -a "$LOG_FILE"
+    local formatted_message="${YELLOW}‼${NC} $1"
+    local plain_message="‼ $1"
+    echo -e "$formatted_message"
+    _log "$plain_message"
 }
 fail() {
-    echo -e "${RED}✗${NC} $1" | tee -a "$LOG_FILE"
+    local formatted_message="${RED}✗${NC} $1"
+    local plain_message="✗ $1"
+    echo -e "$formatted_message"
+    _log "$plain_message"
     exit 1
 }
 
@@ -108,7 +133,6 @@ analyze_system() {
         fail "This script is optimized for Ubuntu LTS. Aborting."
     fi
     
-    # Corrected and safer way to get OS version
     local os_version
     os_version=$(. /etc/os-release; echo "$VERSION_ID")
     
@@ -126,7 +150,6 @@ analyze_system() {
         sudo chmod 600 /swapfile
         sudo mkswap /swapfile
         sudo swapon /swapfile
-        # Add to fstab only if it's not already there
         if ! grep -q "/swapfile" /etc/fstab; then
             echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
         fi
@@ -177,7 +200,6 @@ configure_tuned_mariadb() {
     total_ram_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
     local innodb_buffer_pool_size=$(( total_ram_kb / 4 )) # 25% of RAM
     
-    # Cap at 4GB for smaller servers to avoid memory exhaustion
     if (( innodb_buffer_pool_size > 4194304 )); then
         innodb_buffer_pool_size=4194304
     fi
@@ -263,7 +285,6 @@ EOF
 }
 
 setup_alias() {
-    # Setup alias in both root and user bashrc if possible
     local bash_files=("$HOME/.bashrc")
     if [ -f "/root/.bashrc" ]; then
         bash_files+=("/root/.bashrc")
@@ -291,7 +312,6 @@ add_site() {
     
     read -p "Installation type? (1) Standard (2) Multisite: " site_type
     
-    # --- Database and File Setup ---
     local db_name="wp_$(echo "$domain" | tr '.' '_' | cut -c 1-20)_$(openssl rand -hex 4)"
     local db_user="usr_$(openssl rand -hex 6)"
     local db_pass=$(openssl rand -base64 24)
@@ -330,21 +350,19 @@ define('WP_MEMORY_LIMIT', '128M');
 define('WP_MAX_MEMORY_LIMIT', '256M');
 PHP
 
-    # --- Installation Logic (Standard vs Multisite) ---
     if [[ "$site_type" == "2" ]]; then
         install_multisite "$domain" "$site_dir" "$admin_user" "$admin_pass"
     else
         install_standard_site "$domain" "$site_dir" "$admin_user" "$admin_pass"
     fi
     
-    # --- Finalization ---
     log "Setting secure file permissions..."
     sudo find "$site_dir" -type d -exec chmod 755 {} \;
     sudo find "$site_dir" -type f -exec chmod 644 {} \;
     sudo chmod 600 "${site_dir}/wp-config.php"
     
     create_php_pool "$domain"
-    configure_nginx_site "$domain" "false" # Default to cache off
+    configure_nginx_site "$domain" "false"
     
     log "Requesting Let's Encrypt SSL certificate..."
     if ! sudo certbot --nginx --hsts --uir --staple-ocsp -d "$domain" -d "www.$domain" --non-interactive --agree-tos -m "$ADMIN_EMAIL" --redirect; then
@@ -354,7 +372,7 @@ PHP
     
     save_credentials "$domain" "$admin_user" "$admin_pass" "$db_name" "$db_user" "$db_pass"
     success "Site '$domain' installed successfully!"
-    SITE_DATA=() # Clear temp data
+    SITE_DATA=()
 }
 
 install_standard_site() {
@@ -407,14 +425,12 @@ remove_site() {
     local site_dir="${WEBROOT}/${domain}"
     local db_name db_user
     
-    # Robustly get DB details, even if WP-CLI fails
     if [ -f "${site_dir}/wp-config.php" ]; then
         db_name=$(grep "DB_NAME" "${site_dir}/wp-config.php" | cut -d \' -f 4)
         db_user=$(grep "DB_USER" "${site_dir}/wp-config.php" | cut -d \' -f 4)
     else
         warn "wp-config.php not found for ${domain}. Cannot determine database details to drop."
         db_name=""
-        db_user=""
     fi
     
     log "Removing Nginx config for ${domain}..."
@@ -423,7 +439,7 @@ remove_site() {
     log "Removing PHP-FPM pool for ${domain}..."
     sudo rm -f "/etc/php/${PHP_VERSION}/fpm/pool.d/${domain}.conf"
     
-    if [[ -n "$db_name" && -n "$db_user" ]]; then
+    if [[ -n "$db_name" ]]; then
         log "Dropping database '${db_name}' and user '${db_user}'..."
         mysql --defaults-file="$HOME/.my.cnf" -e "DROP DATABASE IF EXISTS \`${db_name}\`; DROP USER IF EXISTS '${db_user}'@'localhost';"
     fi
@@ -440,9 +456,7 @@ remove_site() {
 # --- Nginx & PHP-FPM Configuration ---
 create_php_pool() {
     local domain="$1"
-    local pool_file="/etc/php/${PHP_VERSION}/fpm/pool.d/${domain}.conf"
-    
-    sudo tee "$pool_file" >/dev/null <<EOF
+    sudo tee "/etc/php/${PHP_VERSION}/fpm/pool.d/${domain}.conf" >/dev/null <<EOF
 [${domain}]
 user = www-data
 group = www-data
@@ -474,21 +488,10 @@ configure_nginx_site() {
     if [[ "$enable_cache" == "true" ]]; then
         cache_config=$(cat <<'EOF'
 set $skip_cache 0;
-# POST requests and URLs with query strings should not be cached
-if ($request_method = POST) {
-    set $skip_cache 1;
-}
-if ($query_string != "") {
-    set $skip_cache 1;
-}
-# Don't cache URIs containing the following segments
-if ($request_uri ~* "/wp-admin/|/xmlrpc.php|wp-.*.php|/feed/|index.php|sitemap(_index)?.xml") {
-    set $skip_cache 1;
-}
-# Don't use the cache for logged-in users or recent commenters
-if ($http_cookie ~* "comment_author|wordpress_logged_in|wp-postpass") {
-    set $skip_cache 1;
-}
+if ($request_method = POST) { set $skip_cache 1; }
+if ($query_string != "") { set $skip_cache 1; }
+if ($request_uri ~* "/wp-admin/|/xmlrpc.php|wp-.*.php|/feed/|index.php|sitemap(_index)?.xml") { set $skip_cache 1; }
+if ($http_cookie ~* "comment_author|wordpress_logged_in|wp-postpass") { set $skip_cache 1; }
 fastcgi_cache_path /var/run/nginx-cache levels=1:2 keys_zone=WORDPRESS:100m inactive=60m;
 fastcgi_cache_key "$scheme$request_method$host$request_uri";
 fastcgi_cache_use_stale error timeout invalid_header http_500;
@@ -505,7 +508,6 @@ EOF
     if sudo -u www-data wp core is-installed --network --path="${WEBROOT}/${domain}" >/dev/null 2>&1; then
         if sudo -u www-data wp config get SUBDOMAIN_INSTALL --path="${WEBROOT}/${domain}" --quiet; then
             multisite_rules="
-# Multisite Subdomain Rules
 if (!-e \$request_filename) {
     rewrite /wp-admin\$ \$scheme://\$host\$uri/ permanent;
     rewrite ^/([_0-9a-zA-Z-]+/)?(wp-(content|admin|includes).*) /\$2 last;
@@ -514,7 +516,6 @@ if (!-e \$request_filename) {
 }"
         else
             multisite_rules="
-# Multisite Subdirectory Rules
 if (!-e \$request_filename) {
     rewrite /wp-admin\$ \$scheme://\$host\$uri/ permanent;
     rewrite ^/[_0-9a-zA-Z-]+/(wp-(content|admin|includes).*) /\$1 last;
@@ -525,16 +526,12 @@ if (!-e \$request_filename) {
     fi
 
     sudo tee "$config_file" >/dev/null <<EOF
-# Main server block for handling HTTPS traffic
 server {
     listen 443 ssl http2;
     server_name ${domain} www.${domain};
     root ${WEBROOT}/${domain};
     index index.php;
-
-    # SSL settings will be added by Certbot below this line
     
-    # Security Headers
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-XSS-Protection "1; mode=block" always;
@@ -542,10 +539,7 @@ server {
     add_header Content-Security-Policy "upgrade-insecure-requests;" always;
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
 
-    # Include the global XML-RPC whitelist
     include ${XMLRPC_WHITELIST_FILE};
-
-    # FastCGI Cache Config
     ${cache_config}
 
     location / {
@@ -557,28 +551,20 @@ server {
     location ~ \.php\$ {
         include snippets/fastcgi-php.conf;
         fastcgi_pass unix:/run/php/php${PHP_VERSION}-${domain}.sock;
-        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
     }
 
-    # Secure XML-RPC by default, allowing only whitelisted IPs
     location = /xmlrpc.php {
-        if (\$xmlrpc_allowed = 0) {
-            return 403;
-        }
+        if (\$xmlrpc_allowed = 0) { return 403; }
         include snippets/fastcgi-php.conf;
         fastcgi_pass unix:/run/php/php${PHP_VERSION}-${domain}.sock;
-        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
     }
 
-    # Block access to sensitive files
     location ~* /(?:uploads|files)/.*\.php\$ { deny all; }
     location ~* \.(bak|config|sql|fla|psd|ini|log|sh|inc|swp|dist)\$ { deny all; }
     location ~ /\. { deny all; }
     location = /readme.html { deny all; }
     location = /license.txt { deny all; }
 }
-
-# Redirect HTTP to HTTPS
 server {
     listen 80;
     server_name ${domain} www.${domain};
@@ -821,18 +807,12 @@ clone_to_staging() {
     local db_name
     db_name=$(sudo -u www-data wp config get DB_NAME --path="$site_dir" --quiet)
     local staging_db_name="${db_name}_staging"
-    local db_user
-    db_user=$(sudo -u www-data wp config get DB_USER --path="$site_dir" --quiet)
-    local db_pass
-    db_pass=$(sudo -u www-data wp config get DB_PASS --path="$site_dir" --quiet)
     
     mysql --defaults-file="$HOME/.my.cnf" -e "CREATE DATABASE \`${staging_db_name}\`;"
     mysqldump --defaults-file="$HOME/.my.cnf" "${db_name}" | mysql --defaults-file="$HOME/.my.cnf" "${staging_db_name}"
     
     log "Configuring staging site..."
     sudo -u www-data wp config set DB_NAME "$staging_db_name" --path="$staging_dir"
-    sudo -u www-data wp config set DB_USER "$db_user" --path="$staging_dir"
-    sudo -u www-data wp config set DB_PASS "$db_pass" --path="$staging_dir"
     
     log "Running search-replace on staging database..."
     sudo -u www-data wp search-replace "https://${domain}" "https://${staging_domain}" --all-tables --path="$staging_dir"
@@ -1019,6 +999,7 @@ check_user
 if [ ! -f "$HOME/.my.cnf" ]; then
     clear
     echo -e "${GREEN}--- Initial Server Setup for WOO Toolkit ---${NC}\n"
+    # This first call to `warn` will now work correctly
     warn "This appears to be the first run. The script will now set up and secure the server."
     read -p "Press Enter to begin the one-time setup..."
     
