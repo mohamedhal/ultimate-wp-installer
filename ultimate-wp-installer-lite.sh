@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ##################################################################################
-# # WordPress Ultimate Operations (WOO) Toolkit - V8.0 (Final Version)             #
+# # WordPress Ultimate Operations (WOO) Toolkit - V8.6 (Final Version)             #
 # #                                                                                #
 # # This script provides a comprehensive, enterprise-grade solution for deploying  #
 # # and managing high-performance, secure, and completely isolated WordPress sites.#
@@ -518,7 +518,8 @@ if (!-e \$request_filename) {
 
     sudo tee "$config_file" >/dev/null <<EOF
 server {
-    listen 443 ssl http2;
+    listen 443 ssl;
+    http2 on;
     server_name ${domain} www.${domain};
     root ${WEBROOT}/${domain};
     index index.php;
@@ -530,7 +531,6 @@ server {
     add_header Content-Security-Policy "upgrade-insecure-requests;" always;
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
 
-    include ${XMLRPC_WHITELIST_FILE};
     ${cache_config}
 
     location / {
