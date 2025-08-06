@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ##################################################################################
-# # WordPress Ultimate Operations (WOO) Toolkit - V7.4 (Definitive DB Security)    #
+# # WordPress Ultimate Operations (WOO) Toolkit - V7.5 (Authoritative DB Reset)    #
 # #                                                                                #
 # # This script provides a comprehensive, enterprise-grade solution for deploying  #
 # # and managing high-performance, secure, and completely isolated WordPress sites.#
@@ -225,19 +225,34 @@ secure_mysql() {
     local db_root_pass
     db_root_pass=$(openssl rand -base64 32)
 
-    log "Forcefully resetting MariaDB root password to a known secure value..."
+    log "Forcefully resetting MariaDB root password..."
+    # Stop the service and kill any lingering processes
     sudo systemctl stop mariadb
-    sudo mysqld_safe --skip-grant-tables --skip-networking &
-    sleep 5
+    sudo killall -KILL mysqld mysqld_safe > /dev/null 2>&1 || true
+    sleep 2
 
-    # The DEFINITIVE sequence to reset a password, regardless of version
-    sudo mysql -u root <<EOF
+    # Start in safe mode and capture the PID
+    sudo mysqld_safe --skip-grant-tables --skip-networking &
+    local mysqld_pid=$!
+    sleep 5
+    
+    # Create a temporary SQL file to avoid shell quoting issues
+    local sql_file="/tmp/mysql-reset-$$.sql"
+    # The DEFINITIVE sequence to reset a password
+    tee "$sql_file" >/dev/null <<EOF
 FLUSH PRIVILEGES;
 ALTER USER 'root'@'localhost' IDENTIFIED BY '${db_root_pass}';
 FLUSH PRIVILEGES;
 EOF
 
-    sudo killall mysqld
+    # Execute the commands
+    sudo mysql -u root < "$sql_file"
+    
+    # Clean up the temp file
+    rm -f "$sql_file"
+    
+    # Kill the specific safe-mode process and restart normally
+    sudo kill -9 "$mysqld_pid"
     sleep 5
     sudo systemctl start mariadb
 
