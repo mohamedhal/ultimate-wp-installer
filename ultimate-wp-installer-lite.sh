@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ##################################################################################
-# # WordPress Ultimate Operations (WOO) Toolkit - V8.2 (Ghost File Cleanup)        #
+# # WordPress Ultimate Operations (WOO) Toolkit - V8.3 (Socket Fix)                #
 # #                                                                                #
 # # This script provides a comprehensive, enterprise-grade solution for deploying  #
 # # and managing high-performance, secure, and completely isolated WordPress sites.#
@@ -212,6 +212,7 @@ secure_mysql() {
     local db_root_pass
     db_root_pass=$(openssl rand -base64 32)
     local service_name="mariadb"
+    local temp_socket="/tmp/mysql.sock"
 
     log "Forcefully resetting MariaDB root password..."
     sudo systemctl stop "$service_name" || true
@@ -228,9 +229,9 @@ secure_mysql() {
     sudo find /var/run/mysqld/ -name "*.sock" -delete || true
     sudo find /var/run/mysqld/ -name "*.pid" -delete || true
     
-    sudo mysqld_safe --skip-grant-tables --skip-networking &
+    sudo mysqld_safe --skip-grant-tables --skip-networking --socket="$temp_socket" &
     local mysqld_pid=$!
-    log "Started mysqld in safe mode with PID $mysqld_pid"
+    log "Started mysqld in safe mode with PID $mysqld_pid on socket $temp_socket"
     sleep 5
     
     local sql_file="/tmp/mysql-reset-$$.sql"
@@ -240,8 +241,8 @@ ALTER USER 'root'@'localhost' IDENTIFIED BY '${db_root_pass}';
 FLUSH PRIVILEGES;
 EOF
 
-    log "Executing password reset..."
-    sudo mysql -u root < "$sql_file"
+    log "Executing password reset on temporary socket..."
+    sudo mysql --socket="$temp_socket" -u root < "$sql_file"
     rm -f "$sql_file"
     
     log "Killing safe mode PID $mysqld_pid..."
