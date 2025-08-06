@@ -300,7 +300,7 @@ create_php_pool() {
     local pool_file="/etc/php/${PHP_VERSION}/fpm/pool.d/${domain}.conf"
     
     # Calculate dynamic values based on available RAM, a more conservative approach
-    local total_ram=$($INSTALL_SUDO free -m | awk '/Mem:/ {print $2}')
+    local total_ram=$($INSTALL_SUDO free -m | awk '/Mem:/ {print int($2*0.5)"M"}')
     local pm_max_children=$(( total_ram / 100 )) # Each child uses approx 100MB
     (( pm_max_children < 5 )) && pm_max_children=5
     
