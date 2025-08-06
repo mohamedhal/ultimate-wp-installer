@@ -286,6 +286,19 @@ install_wordpress() {
     local domain="$1"
     SITE_DATA["SITE_DIR"]="${WEBROOT}/${domain}"
     
+    # Check for existing installation and ask for user permission to remove
+    if [ -d "${SITE_DATA[SITE_DIR]}" ]; then
+        warn "Existing WordPress installation found at ${SITE_DATA[SITE_DIR]}."
+        read -p "Do you want to remove it and start a fresh installation? (y/n) " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            log "Removing existing directory..."
+            $INSTALL_SUDO rm -rf "${SITE_DATA[SITE_DIR]}"
+        else
+            fail "Aborted. To proceed, please manually remove the directory or choose another domain."
+        fi
+    fi
+    
     for ((CURRENT_RETRY=1; CURRENT_RETRY<=MAX_RETRIES; CURRENT_RETRY++)); do
         if validate_dns "$domain"; then
             break
@@ -500,12 +513,12 @@ EOF
 
 # --- Netdata Installation ---
 install_netdata() {
-    log "Installing Netdata server monitoring..."
-    $INSTALL_SUDO wget -O /tmp/netdata-installer.sh https://my-netdata.io/kickstart.sh
-    $INSTALL_SUDO bash /tmp/netdata-installer.sh --dont-wait --stable-channel --non-interactive || warn "Netdata installation failed. Skipping."
-    
-    # Configure Netdata to be accessible via the Nginx server
-    $INSTALL_SUDO tee /etc/nginx/conf.d/netdata.conf >/dev/null <<EOF
+    if ! command -v netdata &>/dev/null; then
+        log "Installing Netdata server monitoring..."
+        $INSTALL_SUDO wget -O /tmp/netdata-installer.sh https://my-netdata.io/kickstart.sh
+        if $INSTALL_SUDO bash /tmp/netdata-installer.sh --dont-wait --stable-channel --non-interactive; then
+            log "Configuring Netdata to be accessible via the Nginx server..."
+            $INSTALL_SUDO tee /etc/nginx/conf.d/netdata.conf >/dev/null <<EOF
 server {
     listen 8000;
     server_name localhost;
@@ -519,9 +532,14 @@ server {
     }
 }
 EOF
-    
-    $INSTALL_SUDO systemctl restart nginx
-    success "Netdata monitoring installed and configured on port 8000."
+            $INSTALL_SUDO systemctl restart nginx
+            success "Netdata monitoring installed and configured on port 8000."
+        else
+            warn "Netdata installation failed. Skipping configuration."
+        fi
+    else
+        success "Netdata is already installed. Skipping installation."
+    fi
 }
 
 # --- Credential Management ---
