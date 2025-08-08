@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# WOO v12.5 — WordPress Ultimate Operations (Self-Installing)
+# WOO v12.6 — WordPress Ultimate Operations (Self-Installing)
 # Target: Ubuntu 22.04/24.04 LTS (OVH, user=ubuntu with sudo)
 # Design: Run-once bootstrap; afterwards `woo` only launches the menu.
 # ==============================================================================
@@ -40,7 +40,6 @@ declare -A SITE_DATA=()
 
 # --------------------------- MySQL Safe Wrappers ------------------------------
 mysql_exec() {
-  # Usage: mysql_exec "SQL STATEMENT;"
   local q="${1:-}"
   if [[ -f "$HOME/.my.cnf" ]]; then
     mysql --defaults-file="$HOME/.my.cnf" -e "$q"
@@ -49,9 +48,8 @@ mysql_exec() {
   fi
 }
 mysqldump_pipe_restore() {
-  # Usage: mysqldump_pipe_restore <source_db> <target_db>
   local src="${1:-}" dst="${2:-}"
-  if [[ -z "$src" || -z "$dst" ]]; then return 1; fi
+  [[ -n "$src" && -n "$dst" ]] || return 1
   if [[ -f "$HOME/.my.cnf" ]]; then
     mysqldump --defaults-file="$HOME/.my.cnf" "$src" | mysql --defaults-file="$HOME/.my.cnf" "$dst"
   else
@@ -160,11 +158,10 @@ server {
 }
 EOF
   [[ -L /etc/nginx/sites-enabled/default ]] || sudo ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
-  sudo nginx -t && sudo systemctl reload nginx
+  sudo nginx -t && sudo systemctl reload nginx || true
 }
 
 ensure_nginx_cache_zone() {
-  # Ensure global cache zone exists in http{} (not inside server{})
   local zfile="/etc/nginx/conf.d/woo-cache.conf"
   if ! grep -qs "keys_zone=WORDPRESS" "$zfile" 2>/dev/null; then
     sudo tee "$zfile" >/dev/null <<'EOF'
@@ -335,7 +332,7 @@ configure_nginx_site() {
   local domain="$1" enable_cache="${2:-false}"
   local config_file="/etc/nginx/sites-available/${domain}"
 
-  # If enabling cache, ensure global zone exists first
+  # Ensure global cache zone exists when enabling cache
   if [[ "$enable_cache" == "true" ]]; then ensure_nginx_cache_zone; fi
 
   local cache_config=""
@@ -688,6 +685,7 @@ list_sites() {
   fi
 }
 
+# ---- domain selector ----------------------------------------------------------
 select_site() {
   local arr=()
   mapfile -t arr < <(ls -1 "${WEBROOT}" 2>/dev/null | grep -v '^html$' || true)
@@ -706,16 +704,29 @@ select_site() {
   fi
 }
 
+# ---- caching manager (fixed: answering 'n' no longer trips ERR) --------------
 manage_caching() {
   clear; echo -e "${BLUE}--- Manage Site Caching ---${NC}\n"
   local domain; domain=$(select_site) || return
   local conf="/etc/nginx/sites-available/${domain}"
   if grep -q "fastcgi_cache WORDPRESS;" "$conf" 2>/dev/null; then
     echo -e "Current: ${GREEN}ENABLED${NC}"
-    read -rp "Disable caching? (y/N): " a; [[ "${a,,}" == "y" ]] && { configure_nginx_site "$domain" "false"; success "Cache disabled."; }
+    read -rp "Disable caching? (y/N): " a
+    if [[ "${a,,}" == "y" ]]; then
+      configure_nginx_site "$domain" "false"
+      success "Cache disabled."
+    else
+      success "No changes."
+    fi
   else
     echo -e "Current: ${RED}DISABLED${NC}"
-    read -rp "Enable caching? (y/N): " a; [[ "${a,,}" == "y" ]] && { configure_nginx_site "$domain" "true"; success "Cache enabled."; }
+    read -rp "Enable caching? (y/N): " a
+    if [[ "${a,,}" == "y" ]]; then
+      configure_nginx_site "$domain" "true"
+      success "Cache enabled."
+    else
+      success "No changes."
+    fi
   fi
 }
 
