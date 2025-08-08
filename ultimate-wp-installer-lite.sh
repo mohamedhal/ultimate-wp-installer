@@ -106,7 +106,6 @@ self_install() {
   # Always ensure a permanent copy exists, even if script was run via a pipe (/dev/fd/*)
   sudo mkdir -p "$INSTALL_DIR"
   # Copy current running script source to TARGET_SCRIPT
-  # Using cat "$0" works for files and /dev/fd/* while the process is alive
   if ! sudo cmp -s <(cat "$0") "$TARGET_SCRIPT" 2>/dev/null; then
     cat "$0" | sudo tee "$TARGET_SCRIPT" >/dev/null
     sudo chmod +x "$TARGET_SCRIPT"
