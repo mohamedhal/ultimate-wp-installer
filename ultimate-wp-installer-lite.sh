@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# WOO v12.1 — WordPress Ultimate Operations (Self-Installing)
+# WOO v12.2 — WordPress Ultimate Operations (Self-Installing)
 # Target: Ubuntu 22.04/24.04 LTS (OVH, user=ubuntu with sudo)
-# Design: Zero-fail, idempotent, run-and-forget + permanent `woo` launcher
+# Design: Run-once bootstrap; afterwards `woo` only launches the menu.
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -31,7 +31,6 @@ readonly WEBROOT="${WEBROOT:-/var/www}"
 readonly MIN_RAM=2048          # MB
 readonly F2B_MAXRETRY=5
 readonly F2B_BANTIME="1d"
-readonly SCRIPT_PATH="$(realpath "$0" 2>/dev/null || echo "$0")"
 readonly INSTALL_DIR="/opt/woo"
 readonly TARGET_SCRIPT="${INSTALL_DIR}/woo.sh"
 readonly CONFIG_DIR="$HOME/.woo-toolkit"
@@ -103,9 +102,8 @@ ensure_swap_if_low_ram() {
 
 # ------------------------- Self-Install (permanent woo) -----------------------
 self_install() {
-  # Always ensure a permanent copy exists, even if script was run via a pipe (/dev/fd/*)
   sudo mkdir -p "$INSTALL_DIR"
-  # Copy current running script source to TARGET_SCRIPT
+  # Always refresh the core script from the current run
   if ! sudo cmp -s <(cat "$0") "$TARGET_SCRIPT" 2>/dev/null; then
     cat "$0" | sudo tee "$TARGET_SCRIPT" >/dev/null
     sudo chmod +x "$TARGET_SCRIPT"
@@ -114,20 +112,14 @@ self_install() {
     success "Core script already up-to-date at ${TARGET_SCRIPT}"
   fi
 
-  # Create/refresh the system-wide launcher:
-  # - With arguments: pass-through
-  # - Without arguments: launch menu (no bootstrap)
-  if [[ ! -f /usr/local/bin/woo ]] || ! grep -q "/opt/woo/woo.sh" /usr/local/bin/woo; then
+  # Launcher: ALWAYS open menu, never bootstrap
+  if [[ ! -f /usr/local/bin/woo ]] || ! grep -q "/opt/woo/woo.sh menu" /usr/local/bin/woo; then
     sudo tee /usr/local/bin/woo >/dev/null <<'EOF'
 #!/usr/bin/env bash
-if [[ $# -gt 0 ]]; then
-  exec bash /opt/woo/woo.sh "$@"
-else
-  exec bash /opt/woo/woo.sh menu
-fi
+exec bash /opt/woo/woo.sh menu
 EOF
     sudo chmod +x /usr/local/bin/woo
-    success "System-wide 'woo' command installed at /usr/local/bin/woo"
+    success "System-wide 'woo' command installed."
   else
     success "'woo' launcher already present."
   fi
@@ -161,7 +153,6 @@ install_dependencies() {
     chmod +x /tmp/wp-cli.phar && sudo mv /tmp/wp-cli.phar /usr/local/bin/wp
   fi
 
-  # unattended upgrades
   echo 'APT::Periodic::Update-Package-Lists "1";' | sudo tee /etc/apt/apt.conf.d/20auto-upgrades >/dev/null
   echo 'APT::Periodic::Unattended-Upgrade "1";' | sudo tee -a /etc/apt/apt.conf.d/20auto-upgrades >/dev/null
 
@@ -169,12 +160,10 @@ install_dependencies() {
 }
 
 configure_nginx_includes() {
-  # Ensure conf.d is included (Ubuntu default already includes sites-enabled)
   if ! grep -q 'include /etc/nginx/conf.d/\*\.conf;' /etc/nginx/nginx.conf; then
     sudo sed -i '/http {/a \    include /etc/nginx/conf.d/*.conf;' /etc/nginx/nginx.conf
   fi
 
-  # Safe default vhost: return 444
   sudo tee /etc/nginx/sites-available/default >/dev/null <<'EOF'
 server {
   listen 80 default_server;
@@ -206,10 +195,7 @@ EOF
 
 secure_mysql() {
   log "Securing MariaDB..."
-  # If ~/.my.cnf exists, assume already secured
   if [[ -f "$HOME/.my.cnf" ]]; then success "MariaDB already secured."; return; fi
-
-  # Try socket login first (fresh installs)
   if sudo mysql -e "SELECT 1" >/dev/null 2>&1; then
     local db_root_pass; db_root_pass="$(openssl rand -base64 32)"
     sudo mysql <<EOF
@@ -229,8 +215,6 @@ EOF
 
 harden_server() {
   log "Hardening server..."
-
-  # UFW
   if ! sudo ufw status | grep -q "Status: active"; then
     sudo ufw default deny incoming || true
     sudo ufw default allow outgoing || true
@@ -239,7 +223,6 @@ harden_server() {
     echo "y" | sudo ufw enable || true
   fi
 
-  # Fail2Ban
   sudo tee /etc/fail2ban/jail.d/wordpress.conf >/dev/null <<EOF
 [sshd]
 enabled = true
@@ -264,12 +247,10 @@ ignoreregex =
 EOF
   sudo systemctl restart fail2ban || true
 
-  # PHP hardening (robust sed)
   sudo sed -i -E 's@^;?\s*expose_php\s*=\s*On@expose_php = Off@' "/etc/php/${PHP_VERSION}/fpm/php.ini" || true
   sudo sed -i -E 's@^;?\s*cgi\.fix_pathinfo\s*=\s*1@cgi.fix_pathinfo=0@' "/etc/php/${PHP_VERSION}/fpm/php.ini" || true
   sudo systemctl restart "php${PHP_VERSION}-fpm" || true
 
-  # XML-RPC whitelist map
   if [[ ! -f "$XMLRPC_WHITELIST_FILE" ]]; then
     sudo tee "$XMLRPC_WHITELIST_FILE" >/dev/null <<'EOF'
 # Managed by WOO Toolkit
@@ -285,7 +266,6 @@ EOF
 }
 
 setup_alias() {
-  # Keep user/root aliases for convenience; launcher makes this optional
   local usr_rc="$HOME/.bashrc"
   grep -q "alias woo=" "$usr_rc" 2>/dev/null || echo "alias woo='bash ${TARGET_SCRIPT}'" >> "$usr_rc"
   if sudo test -f /root/.bashrc; then
@@ -343,7 +323,6 @@ EOF
 )
   fi
 
-  # Multisite rewrite rules (auto-detect)
   local multisite_rules=""
   if sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp core is-installed --network --path="${WEBROOT}/${domain}" >/dev/null 2>&1; then
     if sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get SUBDOMAIN_INSTALL --path="${WEBROOT}/${domain}" --quiet >/dev/null 2>&1; then
@@ -369,7 +348,6 @@ EOF
     fi
   fi
 
-  # IMPORTANT: Emit only port 80 here; Certbot will add SSL later
   sudo tee "$config_file" >/dev/null <<EOF
 server {
   listen 80;
@@ -622,12 +600,10 @@ remove_site() {
   local domain; domain=$(select_site) || return
   warn "This will permanently delete ${domain} (files, DB, users, config)."
   read -rp "Type the domain to confirm: " confirm
-  # ---- FIX: tolerant confirmation (trims whitespace) ----
   local clean_confirm clean_domain
   clean_confirm="$(echo -n "$confirm" | tr -d ' \t\r\n')"
   clean_domain="$(echo -n "$domain" | tr -d ' \t\r\n')"
   [[ "$clean_confirm" == "$clean_domain" ]] || { warn "Confirmation mismatch. Aborted."; return; }
-
   remove_site_silent "$domain"
   success "Site ${domain} removed."
 }
@@ -659,23 +635,29 @@ list_sites() {
   fi
 }
 
+# ---- FIXED: prompts on stderr; only domain on stdout ----
 select_site() {
   local arr=()
   mapfile -t arr < <(ls -1 "${WEBROOT}" 2>/dev/null | grep -v '^html$' || true)
   ((${#arr[@]})) || { warn "No sites available."; return 1; }
-  echo "Select a site:"
+  >&2 echo "Please select a site to manage:"
   local i
-  for i in "${!arr[@]}"; do echo "  $((i+1))) ${arr[$i]}"; done
-  local choice; read -rp "Enter number: " choice
-  [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#arr[@]} )) || { warn "Invalid."; return 1; }
-  echo "${arr[$((choice-1))]}"
+  for i in "${!arr[@]}"; do >&2 echo "  $((i+1))) ${arr[$i]}"; done
+  local choice
+  read -rp "Enter number: " choice
+  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#arr[@]} )); then
+      echo "${arr[$((choice-1))]}"
+  else
+      warn "Invalid selection."
+      return 1
+  fi
 }
 
 manage_caching() {
   clear; echo -e "${BLUE}--- Manage Site Caching ---${NC}\n"
   local domain; domain=$(select_site) || return
   local conf="/etc/nginx/sites-available/${domain}"
-  if grep -q "fastcgi_cache WORDPRESS;" "$conf"; then
+  if grep -q "fastcgi_cache WORDPRESS;" "$conf" 2>/dev/null; then
     echo -e "Current: ${GREEN}ENABLED${NC}"
     read -rp "Disable caching? (y/N): " a; [[ "${a,,}" == "y" ]] && { configure_nginx_site "$domain" "false"; success "Cache disabled."; }
   else
@@ -692,7 +674,7 @@ manage_xmlrpc() {
       | awk '{print " - " $1}' || echo " - None"
     echo -e "\n1) Add IP  2) Remove IP  3) Back"
     read -rp "Choice: " c
-    case "$c" in
+    case "$c$" in
       1)
         read -rp "IP to add: " ip
         [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { warn "Invalid IP."; continue; }
@@ -758,7 +740,6 @@ configure_scheduled_backups() {
     rm -f "$BACKUP_CONFIG_FILE" || true
   fi
 
-  # Use TARGET_SCRIPT so cron always runs the persistent copy
   (crontab -l 2>/dev/null | grep -v "${TARGET_SCRIPT} backup-all"; echo "0 2 * * * bash ${TARGET_SCRIPT} backup-all") | crontab -
   success "Daily backups scheduled."
 }
@@ -784,7 +765,6 @@ backup_all_sites() {
       rsync -a -e ssh "$archive" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}" || warn "Off-site sync failed for ${domain}"
     fi
 
-    # keep 7 newest
     ls -tp "${bd}"/full_*.tar.gz 2>/dev/null | tail -n +8 | xargs -r -d '\n' rm -f --
   done
   log "--- Backups Done ---"
@@ -943,19 +923,20 @@ main_menu() {
 
 # ------------------------------- Entry ----------------------------------------
 main() {
-  # Fast path: if asked for menu, just open it and exit (no bootstrap).
+  # FAST PATH: if called with 'menu', open the menu and exit (no bootstrap).
   if [[ "${1:-}" == "menu" ]]; then
     main_menu
     exit 0
   fi
 
-  # CRON entry points (use the persistent copy path)
+  # CRON entry points
   if [[ "${1:-}" == "backup-all" ]]; then backup_all_sites; exit 0; fi
   if [[ "${1:-}" == "remove-site-silent" && -n "${2:-}" ]]; then remove_site_silent "$2"; exit 0; fi
 
+  # First-time bootstrap (only when not launched via `menu`)
   require_sudo
   check_os
-  self_install            # ensures /opt/woo/woo.sh and `woo` launcher
+  self_install
   ensure_swap_if_low_ram
   install_dependencies
   configure_nginx_includes
