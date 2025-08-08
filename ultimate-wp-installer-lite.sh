@@ -260,6 +260,18 @@ setup_alias() {
   fi
 }
 
+# NEW: system-wide launcher so `woo` always works
+install_launcher() {
+  if ! command -v woo >/dev/null 2>&1 || ! grep -q "$SCRIPT_PATH" /usr/local/bin/woo 2>/dev/null; then
+    sudo tee /usr/local/bin/woo >/dev/null <<EOF
+#!/usr/bin/env bash
+exec bash "${SCRIPT_PATH}" "\$@"
+EOF
+    sudo chmod +x /usr/local/bin/woo
+    success "System-wide 'woo' command installed at /usr/local/bin/woo"
+  fi
+}
+
 # --------------------------- Site Operations ----------------------------------
 create_php_pool() {
   local domain="$1"
@@ -403,6 +415,90 @@ EOF
   success "Credentials saved to $cred_file"
 }
 
+# NEW: Post-install provision report (printed + saved)
+print_site_report() {
+  local domain="$1" admin_user="$2" admin_pass="$3" db_name="$4" db_user="$5" db_pass="$6" admin_email="$7" site_dir="$8"
+  local report_dir="$HOME/woo_credentials"
+  local report_file="${report_dir}/${domain}_report.txt"
+  local php_pool="/etc/php/${PHP_VERSION}/fpm/pool.d/${domain}.conf"
+  local nginx_vhost="/etc/nginx/sites-available/${domain}"
+  local cert_status="Pending"
+  local redis_status="Enabled"
+  local cache_tip="Disabled (enable via: Menu → Manage Site Caching)"
+
+  mkdir -p "$report_dir"
+
+  # Detect SSL (best-effort)
+  if [ -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]; then
+    cert_status="Active"
+  fi
+
+  # Detect FastCGI cache in vhost
+  if grep -q "fastcgi_cache WORDPRESS;" "$nginx_vhost" 2>/dev/null; then
+    cache_tip="Enabled (you can toggle from the menu)"
+  fi
+
+  local box_line="================================================================================"
+
+  tee "$report_file" >/dev/null <<EOF
+$box_line
+WOO Site Provision Report — ${domain}
+$box_line
+
+Site URLs:
+- Frontend:            https://${domain}
+- Admin:               https://${domain}/wp-admin
+
+Admin Credentials:
+- Username:            ${admin_user}
+- Password:            ${admin_pass}
+- Admin Email:         ${admin_email}
+
+Database:
+- DB Name:             ${db_name}
+- DB User:             ${db_user}
+- DB Pass:             ${db_pass}
+
+Paths & Services:
+- Webroot:             ${site_dir}
+- PHP-FPM Pool:        ${php_pool}
+- Nginx vHost:         ${nginx_vhost}
+- Redis Object Cache:  ${redis_status}
+- HTTPS (Let's Encrypt): ${cert_status}
+- FastCGI Cache:       ${cache_tip}
+
+What was done:
+- Created per-site DB + DB user with limited scope
+- Downloaded and configured WordPress with secure salts and custom table prefix
+- Set Redis object caching and sensible WP constants (SSL admin, no file editor, memory limits)
+- Created isolated PHP-FPM pool/socket for ${domain}
+- Wrote Nginx vhost (HTTP first; Certbot upgrades to HTTPS)
+- Requested Let's Encrypt certificate (if DNS ready)
+- Secured file permissions
+
+Recommended next steps:
+- Verify DNS A/AAAA records for ${domain} and www.${domain}
+- If HTTPS shows "Pending": re-run cert issuance later with:
+    sudo certbot --nginx -d ${domain} -d www.${domain} --redirect --hsts --staple-ocsp
+- Enable/disable FastCGI cache from: Menu → "Manage Site Caching"
+- Create a first on-demand backup from: Menu → "Backup Management"
+- (Optional) Configure scheduled backups with off-site rsync/scp in the same menu
+
+This report is saved at:
+${report_file}
+$box_line
+EOF
+
+  echo -e "\n${GREEN}Provision report written to:${NC} ${report_file}\n"
+  echo "----- COPY/PASTE CREDENTIALS -----"
+  echo "URL: https://${domain}"
+  echo "Admin: https://${domain}/wp-admin"
+  echo "User: ${admin_user}"
+  echo "Pass: ${admin_pass}"
+  echo "DB:   ${db_name} | ${db_user} | ${db_pass}"
+  echo "----------------------------------"
+}
+
 install_standard_site() {
   local domain="$1" site_dir="$2" admin_user="$3" admin_pass="$4" admin_email="$5"
   sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp core install \
@@ -513,6 +609,7 @@ PHP
   fi
 
   save_credentials "$domain" "$admin_user" "$admin_pass" "$db_name" "$db_user" "$db_pass"
+  print_site_report "$domain" "$admin_user" "$admin_pass" "$db_name" "$db_user" "$db_pass" "$admin_email" "$site_dir"
   success "Site '${domain}' installed."
   SITE_DATA=()
 }
@@ -851,6 +948,7 @@ main() {
   configure_tuned_mariadb
   harden_server
   setup_alias
+  install_launcher   # NEW: make `woo` available system-wide
 
   success "Initial server setup complete."
   main_menu
