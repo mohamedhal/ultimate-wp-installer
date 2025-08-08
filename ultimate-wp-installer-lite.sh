@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# WOO v12.4 — WordPress Ultimate Operations (Self-Installing)
+# WOO v12.5 — WordPress Ultimate Operations (Self-Installing)
 # Target: Ubuntu 22.04/24.04 LTS (OVH, user=ubuntu with sudo)
 # Design: Run-once bootstrap; afterwards `woo` only launches the menu.
 # ==============================================================================
@@ -48,7 +48,6 @@ mysql_exec() {
     sudo mysql -e "$q"
   fi
 }
-
 mysqldump_pipe_restore() {
   # Usage: mysqldump_pipe_restore <source_db> <target_db>
   local src="${1:-}" dst="${2:-}"
@@ -145,6 +144,37 @@ EOF
   fi
 }
 
+# ------------------------------ Nginx helpers ---------------------------------
+configure_nginx_includes() {
+  if ! grep -q 'include /etc/nginx/conf.d/\*\.conf;' /etc/nginx/nginx.conf; then
+    sudo sed -i '/http {/a \    include /etc/nginx/conf.d/*.conf;' /etc/nginx/nginx.conf
+  fi
+
+  sudo tee /etc/nginx/sites-available/default >/dev/null <<'EOF'
+server {
+  listen 80 default_server;
+  listen [::]:80 default_server;
+  server_name _;
+  root /var/www/html;
+  return 444;
+}
+EOF
+  [[ -L /etc/nginx/sites-enabled/default ]] || sudo ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
+  sudo nginx -t && sudo systemctl reload nginx
+}
+
+ensure_nginx_cache_zone() {
+  # Ensure global cache zone exists in http{} (not inside server{})
+  local zfile="/etc/nginx/conf.d/woo-cache.conf"
+  if ! grep -qs "keys_zone=WORDPRESS" "$zfile" 2>/dev/null; then
+    sudo tee "$zfile" >/dev/null <<'EOF'
+# Global cache zone for WordPress (http context)
+fastcgi_cache_path /var/run/nginx-cache levels=1:2 keys_zone=WORDPRESS:100m inactive=60m use_temp_path=off;
+EOF
+    sudo nginx -t && sudo systemctl reload nginx || warn "Nginx reload failed after adding cache zone."
+  fi
+}
+
 # ------------------------------ Bootstrap -------------------------------------
 add_ppa_once() {
   local ppa="$1"
@@ -177,24 +207,6 @@ install_dependencies() {
   echo 'APT::Periodic::Unattended-Upgrade "1";' | sudo tee -a /etc/apt/apt.conf.d/20auto-upgrades >/dev/null
 
   success "Dependencies installed."
-}
-
-configure_nginx_includes() {
-  if ! grep -q 'include /etc/nginx/conf.d/\*\.conf;' /etc/nginx/nginx.conf; then
-    sudo sed -i '/http {/a \    include /etc/nginx/conf.d/*.conf;' /etc/nginx/nginx.conf
-  fi
-
-  sudo tee /etc/nginx/sites-available/default >/dev/null <<'EOF'
-server {
-  listen 80 default_server;
-  listen [::]:80 default_server;
-  server_name _;
-  root /var/www/html;
-  return 444;
-}
-EOF
-  [[ -L /etc/nginx/sites-enabled/default ]] || sudo ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
-  sudo nginx -t && sudo systemctl reload nginx
 }
 
 configure_tuned_mariadb() {
@@ -323,6 +335,9 @@ configure_nginx_site() {
   local domain="$1" enable_cache="${2:-false}"
   local config_file="/etc/nginx/sites-available/${domain}"
 
+  # If enabling cache, ensure global zone exists first
+  if [[ "$enable_cache" == "true" ]]; then ensure_nginx_cache_zone; fi
+
   local cache_config=""
   if [[ "$enable_cache" == "true" ]]; then
     cache_config=$(cat <<'EOF'
@@ -331,7 +346,8 @@ if ($request_method = POST) { set $skip_cache 1; }
 if ($query_string != "") { set $skip_cache 1; }
 if ($request_uri ~* "/wp-admin/|/xmlrpc.php|wp-.*.php|/feed/|index.php|sitemap(_index)?.xml") { set $skip_cache 1; }
 if ($http_cookie ~* "comment_author|wordpress_logged_in|wp-postpass") { set $skip_cache 1; }
-fastcgi_cache_path /var/run/nginx-cache levels=1:2 keys_zone=WORDPRESS:100m inactive=60m;
+
+# Use the global cache zone "WORDPRESS" defined in /etc/nginx/conf.d/woo-cache.conf
 fastcgi_cache_key "$scheme$request_method$host$request_uri";
 fastcgi_cache_use_stale error timeout invalid_header http_500;
 fastcgi_ignore_headers Cache-Control Expires Set-Cookie;
@@ -406,7 +422,18 @@ server {
 EOF
 
   [[ -L "/etc/nginx/sites-enabled/${domain}" ]] || sudo ln -s "$config_file" "/etc/nginx/sites-enabled/${domain}"
-  sudo nginx -t && sudo systemctl reload nginx
+
+  # Test & reload without tripping ERR trap
+  set +e
+  sudo nginx -t
+  local rc=$?
+  set -e
+  if (( rc == 0 )); then
+    sudo systemctl reload nginx
+  else
+    warn "Nginx config test failed; leaving previous config active."
+    return 1
+  fi
 }
 
 save_credentials() {
@@ -771,7 +798,7 @@ configure_scheduled_backups() {
 
 backup_all_sites() {
   log "--- All-Sites Scheduled Backup ---"
-  local s; mapfile -t s < <(ls -1 "${WEBROOT}" 2>/div/null | grep -v '^html$' || true)
+  local s; mapfile -t s < <(ls -1 "${WEBROOT}" 2>/dev/null | grep -v '^html$' || true)
   for domain in "${s[@]}"; do
     local sd="${WEBROOT}/${domain}" bd="$HOME/woo_backups/${domain}"
     mkdir -p "$bd"
@@ -962,6 +989,7 @@ main() {
   ensure_swap_if_low_ram
   install_dependencies
   configure_nginx_includes
+  ensure_nginx_cache_zone
   secure_mysql
   configure_tuned_mariadb
   harden_server
