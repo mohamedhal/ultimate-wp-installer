@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# WOO v12.2 — WordPress Ultimate Operations (Self-Installing)
+# WOO v12.3 — WordPress Ultimate Operations (Self-Installing)
 # Target: Ubuntu 22.04/24.04 LTS (OVH, user=ubuntu with sudo)
 # Design: Run-once bootstrap; afterwards `woo` only launches the menu.
 # ==============================================================================
@@ -608,19 +608,28 @@ remove_site() {
   success "Site ${domain} removed."
 }
 
+# --- FIX: read DB creds without touching 600-perm files as ubuntu; prefer WP-CLI ---
 remove_site_silent() {
   local domain="$1"
   local site_dir="${WEBROOT}/${domain}"
-  local db_name db_user
-  if [[ -f "${site_dir}/wp-config.php" ]]; then
-    db_name=$(grep "DB_NAME" "${site_dir}/wp-config.php" | cut -d\' -f4)
-    db_user=$(grep "DB_USER" "${site_dir}/wp-config.php" | cut -d\' -f4)
+  local db_name="" db_user=""
+
+  if [[ -d "$site_dir" ]]; then
+    # Try WP-CLI first
+    if sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get DB_NAME --path="$site_dir" --quiet >/dev/null 2>&1; then
+      db_name=$(sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get DB_NAME --path="$site_dir" --quiet)
+      db_user=$(sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get DB_USER --path="$site_dir" --quiet)
+    elif sudo test -r "${site_dir}/wp-config.php"; then
+      # Fallback: read via sudo in case owner is www-data with 600 perms
+      db_name=$(sudo awk -F"'" '/DB_NAME/{print $4;exit}' "${site_dir}/wp-config.php" 2>/dev/null || echo "")
+      db_user=$(sudo awk -F"'" '/DB_USER/{print $4;exit}' "${site_dir}/wp-config.php" 2>/dev/null || echo "")
+    fi
   fi
 
   sudo rm -f "/etc/nginx/sites-available/${domain}" "/etc/nginx/sites-enabled/${domain}"
   sudo rm -f "/etc/php/${PHP_VERSION}/fpm/pool.d/${domain}.conf"
   if [[ -n "${db_name:-}" ]]; then
-    mysql --defaults-file="$HOME/.my.cnf" -e "DROP DATABASE IF EXISTS ${db_name}; DROP USER IF EXISTS '${db_user}'@'localhost'; FLUSH PRIVILEGES;"
+    mysql --defaults-file="$HOME/.my.cnf" -e "DROP DATABASE IF EXISTS \`${db_name}\`; DROP USER IF EXISTS '${db_user}'@'localhost'; FLUSH PRIVILEGES;" || warn "DB cleanup warning for ${domain}"
   fi
   sudo rm -rf "$site_dir"
   sudo systemctl reload nginx "php${PHP_VERSION}-fpm"
@@ -635,7 +644,7 @@ list_sites() {
   fi
 }
 
-# ---- FIXED: prompts on stderr; only domain on stdout ----
+# ---- Improved: prompts on stderr; accepts number OR domain on input ----
 select_site() {
   local arr=()
   mapfile -t arr < <(ls -1 "${WEBROOT}" 2>/dev/null | grep -v '^html$' || true)
@@ -644,7 +653,10 @@ select_site() {
   local i
   for i in "${!arr[@]}"; do >&2 echo "  $((i+1))) ${arr[$i]}"; done
   local choice
-  read -rp "Enter number: " choice
+  read -rp "Enter number or domain: " choice
+  # If exact domain entered
+  for i in "${!arr[@]}"; do [[ "$choice" == "${arr[$i]}" ]] && { echo "$choice"; return 0; }; done
+  # Or numeric index
   if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#arr[@]} )); then
       echo "${arr[$((choice-1))]}"
   else
@@ -674,7 +686,7 @@ manage_xmlrpc() {
       | awk '{print " - " $1}' || echo " - None"
     echo -e "\n1) Add IP  2) Remove IP  3) Back"
     read -rp "Choice: " c
-    case "$c$" in
+    case "$c" in
       1)
         read -rp "IP to add: " ip
         [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { warn "Invalid IP."; continue; }
@@ -688,7 +700,7 @@ manage_xmlrpc() {
       2)
         read -rp "IP to remove: " ip
         if sudo grep -q "$ip" "$XMLRPC_WHITELIST_FILE"; then
-          sudo sed -i "/${ip}[[:space:]]\+1;/d" "$XMLRPC_WHITELIST_FILE"
+          sudo sed -i -E "/^[[:space:]]*${ip}[[:space:]]+1;/d" "$XMLRPC_WHITELIST_FILE"
           sudo nginx -t && sudo systemctl reload nginx
           success "Removed."
         else
@@ -712,7 +724,6 @@ create_on_demand_backup() {
   local db_backup="${backup_dir}/db_${ts}.sql"
   local tmp_db="/tmp/db_${domain}_${ts}.sql"
 
-  local db_name; db_name=$(sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get DB_NAME --path="$site_dir" --quiet)
   sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp db export "$tmp_db" --path="$site_dir"
   sudo mv "$tmp_db" "$db_backup"
   sudo tar -czf "$file_backup" -C "$WEBROOT" "$domain"
@@ -752,7 +763,6 @@ backup_all_sites() {
     mkdir -p "$bd"
     local d; d="$(date +%Y%m%d)"
     local tmp_db="/tmp/db_${domain}_${d}.sql"
-    local db_name; db_name=$(sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get DB_NAME --path="$sd" --quiet)
     sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp db export "$tmp_db" --path="$sd"
     local archive="${bd}/full_${d}.tar.gz"
     sudo tar -czf "$archive" -C "$WEBROOT" "$domain" -C /tmp "$(basename "$tmp_db")"
@@ -765,7 +775,7 @@ backup_all_sites() {
       rsync -a -e ssh "$archive" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}" || warn "Off-site sync failed for ${domain}"
     fi
 
-    ls -tp "${bd}"/full_*.tar.gz 2>/dev/null | tail -n +8 | xargs -r -d '\n' rm -f --
+    ls -tp "${bd}"/full_*.tar.gz 2>/dev/null | tail -n +8 | xargs -r -d $'\n' rm -f --
   done
   log "--- Backups Done ---"
 }
@@ -789,9 +799,9 @@ clone_to_staging() {
   db_user=$(sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get DB_USER --path="$sd" --quiet)
   local sdb="${db_name}_stg_$(openssl rand -hex 3)"
 
-  mysql --defaults-file="$HOME/.my.cnf" -e "CREATE DATABASE ${sdb};"
+  mysql --defaults-file="$HOME/.my.cnf" -e "CREATE DATABASE \`${sdb}\`;"
   mysqldump --defaults-file="$HOME/.my.cnf" "${db_name}" | mysql --defaults-file="$HOME/.my.cnf" "${sdb}"
-  mysql --defaults-file="$HOME/.my.cnf" -e "GRANT ALL PRIVILEGES ON ${sdb}.* TO '${db_user}'@'localhost'; FLUSH PRIVILEGES;"
+  mysql --defaults-file="$HOME/.my.cnf" -e "GRANT ALL PRIVILEGES ON \`${sdb}\`.* TO '${db_user}'@'localhost'; FLUSH PRIVILEGES;"
 
   log "Pointing staging to new DB..."
   sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set DB_NAME "$sdb" --path="$td"
@@ -843,15 +853,16 @@ manage_debugging() {
   local domain; domain=$(select_site) || return
   local dir="${WEBROOT}/${domain}"
   while true; do
-    local dbg; dbg=$(sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get WP_DEBUG --path="$dir" --quiet && echo ON || echo OFF)
-    echo "WP_DEBUG: $dbg"
+    local dbg_val; dbg_val=$(sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get WP_DEBUG --path="$dir" --quiet 2>/dev/null || echo "false")
+    local dbg_display="OFF"; [[ "$dbg_val" == "true" ]] && dbg_display="ON"
+    echo "WP_DEBUG: $dbg_display"
     echo "1) Toggle WP_DEBUG"
     echo "2) Tail debug.log"
     echo "3) Back"
     read -rp "Choice: " c
     case "$c" in
       1)
-        if [[ "$dbg" == "ON" ]]; then
+        if [[ "$dbg_val" == "true" ]]; then
           sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set WP_DEBUG false --raw --path="$dir"
           sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set WP_DEBUG_LOG false --raw --path="$dir"
           sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set WP_DEBUG_DISPLAY false --raw --path="$dir"
