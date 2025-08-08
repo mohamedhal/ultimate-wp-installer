@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ##################################################################################
-# # WordPress Ultimate Operations (WOO) Toolkit - V9.3 (Final Polished Version)    #
+# # WordPress Ultimate Operations (WOO) Toolkit - V10.0 (The Phoenix)              #
 # #                                                                                #
 # # This script provides a comprehensive, enterprise-grade solution for deploying  #
 # # and managing high-performance, secure, and completely isolated WordPress sites.#
@@ -211,6 +211,8 @@ secure_mysql() {
     local db_root_pass
     db_root_pass=$(openssl rand -base64 32)
     
+    # This is the standard, best-practice sequence for a fresh MariaDB installation.
+    # It assumes passwordless socket authentication for the root user, which is the default.
     sudo mysql -u root <<EOF
 ALTER USER 'root'@'localhost' IDENTIFIED BY '${db_root_pass}';
 DELETE FROM mysql.user WHERE User='';
@@ -542,7 +544,8 @@ if (!-e \$request_filename) {
 
     sudo tee "$config_file" >/dev/null <<EOF
 server {
-    listen 443 ssl http2;
+    listen 443 ssl;
+    http2 on;
     server_name ${domain} www.${domain};
     root ${WEBROOT}/${domain};
     index index.php;
