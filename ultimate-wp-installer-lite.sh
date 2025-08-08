@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# WOO v12.6 — WordPress Ultimate Operations (Self-Installing)
-# Target: Ubuntu 22.04/24.04 LTS (OVH, user=ubuntu with sudo)
+# WOO v13 — WordPress Ultimate Operations (Self-Installing)
+# Target: Ubuntu 22.04/24.04 LTS
 # Design: Run-once bootstrap; afterwards `woo` only launches the menu.
 # ==============================================================================
 
