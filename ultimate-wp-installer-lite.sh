@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# WOO v12.3 — WordPress Ultimate Operations (Self-Installing)
+# WOO v12.4 — WordPress Ultimate Operations (Self-Installing)
 # Target: Ubuntu 22.04/24.04 LTS (OVH, user=ubuntu with sudo)
 # Design: Run-once bootstrap; afterwards `woo` only launches the menu.
 # ==============================================================================
@@ -38,6 +38,28 @@ readonly BACKUP_CONFIG_FILE="$CONFIG_DIR/backup.conf"
 readonly XMLRPC_WHITELIST_FILE="/etc/nginx/conf.d/xmlrpc_whitelist.conf"
 declare -A SITE_DATA=()
 
+# --------------------------- MySQL Safe Wrappers ------------------------------
+mysql_exec() {
+  # Usage: mysql_exec "SQL STATEMENT;"
+  local q="${1:-}"
+  if [[ -f "$HOME/.my.cnf" ]]; then
+    mysql --defaults-file="$HOME/.my.cnf" -e "$q"
+  else
+    sudo mysql -e "$q"
+  fi
+}
+
+mysqldump_pipe_restore() {
+  # Usage: mysqldump_pipe_restore <source_db> <target_db>
+  local src="${1:-}" dst="${2:-}"
+  if [[ -z "$src" || -z "$dst" ]]; then return 1; fi
+  if [[ -f "$HOME/.my.cnf" ]]; then
+    mysqldump --defaults-file="$HOME/.my.cnf" "$src" | mysql --defaults-file="$HOME/.my.cnf" "$dst"
+  else
+    sudo mysqldump "$src" | sudo mysql "$dst"
+  fi
+}
+
 # ------------------------------ Error Handler ---------------------------------
 error_handler() {
   local line="${1:-?}" cmd="${2:-?}" status="${3:-$?}"
@@ -46,11 +68,11 @@ error_handler() {
   set +e
   if [[ -n "${SITE_DATA[DB_NAME]:-}" ]]; then
     log "Dropping DB: ${SITE_DATA[DB_NAME]}"
-    mysql --defaults-file="$HOME/.my.cnf" -e "DROP DATABASE IF EXISTS ${SITE_DATA[DB_NAME]};" >/dev/null 2>&1 || true
+    mysql_exec "DROP DATABASE IF EXISTS \`${SITE_DATA[DB_NAME]}\`;"
   fi
   if [[ -n "${SITE_DATA[DB_USER]:-}" ]]; then
     log "Dropping DB user: ${SITE_DATA[DB_USER]}"
-    mysql --defaults-file="$HOME/.my.cnf" -e "DROP USER IF EXISTS '${SITE_DATA[DB_USER]}'@'localhost';" >/dev/null 2>&1 || true
+    mysql_exec "DROP USER IF EXISTS '${SITE_DATA[DB_USER]}'@'localhost'; FLUSH PRIVILEGES;"
   fi
   if [[ -n "${SITE_DATA[SITE_DIR]:-}" ]]; then
     log "Removing site dir: ${SITE_DATA[SITE_DIR]}"
@@ -103,7 +125,6 @@ ensure_swap_if_low_ram() {
 # ------------------------- Self-Install (permanent woo) -----------------------
 self_install() {
   sudo mkdir -p "$INSTALL_DIR"
-  # Always refresh the core script from the current run
   if ! sudo cmp -s <(cat "$0") "$TARGET_SCRIPT" 2>/dev/null; then
     cat "$0" | sudo tee "$TARGET_SCRIPT" >/dev/null
     sudo chmod +x "$TARGET_SCRIPT"
@@ -112,7 +133,6 @@ self_install() {
     success "Core script already up-to-date at ${TARGET_SCRIPT}"
   fi
 
-  # Launcher: ALWAYS open menu, never bootstrap
   if [[ ! -f /usr/local/bin/woo ]] || ! grep -q "/opt/woo/woo.sh menu" /usr/local/bin/woo; then
     sudo tee /usr/local/bin/woo >/dev/null <<'EOF'
 #!/usr/bin/env bash
@@ -538,12 +558,9 @@ add_site() {
   SITE_DATA[DB_NAME]="$db_name"; SITE_DATA[DB_USER]="$db_user"
 
   log "Creating DB/user..."
-  mysql --defaults-file="$HOME/.my.cnf" <<EOF
-CREATE DATABASE ${db_name} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER '${db_user}'@'localhost' IDENTIFIED BY '${db_pass}';
-GRANT ALL PRIVILEGES ON ${db_name}.* TO '${db_user}'@'localhost';
-FLUSH PRIVILEGES;
-EOF
+  mysql_exec "CREATE DATABASE \`${db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+  mysql_exec "CREATE USER '${db_user}'@'localhost' IDENTIFIED BY '${db_pass}';"
+  mysql_exec "GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'localhost'; FLUSH PRIVILEGES;"
 
   log "Preparing site dir: $site_dir"
   sudo mkdir -p "$site_dir"
@@ -608,19 +625,16 @@ remove_site() {
   success "Site ${domain} removed."
 }
 
-# --- FIX: read DB creds without touching 600-perm files as ubuntu; prefer WP-CLI ---
 remove_site_silent() {
   local domain="$1"
   local site_dir="${WEBROOT}/${domain}"
   local db_name="" db_user=""
 
   if [[ -d "$site_dir" ]]; then
-    # Try WP-CLI first
     if sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get DB_NAME --path="$site_dir" --quiet >/dev/null 2>&1; then
       db_name=$(sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get DB_NAME --path="$site_dir" --quiet)
       db_user=$(sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get DB_USER --path="$site_dir" --quiet)
     elif sudo test -r "${site_dir}/wp-config.php"; then
-      # Fallback: read via sudo in case owner is www-data with 600 perms
       db_name=$(sudo awk -F"'" '/DB_NAME/{print $4;exit}' "${site_dir}/wp-config.php" 2>/dev/null || echo "")
       db_user=$(sudo awk -F"'" '/DB_USER/{print $4;exit}' "${site_dir}/wp-config.php" 2>/dev/null || echo "")
     fi
@@ -629,7 +643,10 @@ remove_site_silent() {
   sudo rm -f "/etc/nginx/sites-available/${domain}" "/etc/nginx/sites-enabled/${domain}"
   sudo rm -f "/etc/php/${PHP_VERSION}/fpm/pool.d/${domain}.conf"
   if [[ -n "${db_name:-}" ]]; then
-    mysql --defaults-file="$HOME/.my.cnf" -e "DROP DATABASE IF EXISTS \`${db_name}\`; DROP USER IF EXISTS '${db_user}'@'localhost'; FLUSH PRIVILEGES;" || warn "DB cleanup warning for ${domain}"
+    mysql_exec "DROP DATABASE IF EXISTS \`${db_name}\`;"
+    mysql_exec "DROP USER IF EXISTS '${db_user}'@'localhost'; FLUSH PRIVILEGES;"
+  else
+    warn "DB credentials not found; skipped DB cleanup for ${domain}"
   fi
   sudo rm -rf "$site_dir"
   sudo systemctl reload nginx "php${PHP_VERSION}-fpm"
@@ -644,7 +661,6 @@ list_sites() {
   fi
 }
 
-# ---- Improved: prompts on stderr; accepts number OR domain on input ----
 select_site() {
   local arr=()
   mapfile -t arr < <(ls -1 "${WEBROOT}" 2>/dev/null | grep -v '^html$' || true)
@@ -654,9 +670,7 @@ select_site() {
   for i in "${!arr[@]}"; do >&2 echo "  $((i+1))) ${arr[$i]}"; done
   local choice
   read -rp "Enter number or domain: " choice
-  # If exact domain entered
   for i in "${!arr[@]}"; do [[ "$choice" == "${arr[$i]}" ]] && { echo "$choice"; return 0; }; done
-  # Or numeric index
   if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#arr[@]} )); then
       echo "${arr[$((choice-1))]}"
   else
@@ -757,7 +771,7 @@ configure_scheduled_backups() {
 
 backup_all_sites() {
   log "--- All-Sites Scheduled Backup ---"
-  local s; mapfile -t s < <(ls -1 "${WEBROOT}" 2>/dev/null | grep -v '^html$' || true)
+  local s; mapfile -t s < <(ls -1 "${WEBROOT}" 2>/div/null | grep -v '^html$' || true)
   for domain in "${s[@]}"; do
     local sd="${WEBROOT}/${domain}" bd="$HOME/woo_backups/${domain}"
     mkdir -p "$bd"
@@ -799,9 +813,9 @@ clone_to_staging() {
   db_user=$(sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get DB_USER --path="$sd" --quiet)
   local sdb="${db_name}_stg_$(openssl rand -hex 3)"
 
-  mysql --defaults-file="$HOME/.my.cnf" -e "CREATE DATABASE \`${sdb}\`;"
-  mysqldump --defaults-file="$HOME/.my.cnf" "${db_name}" | mysql --defaults-file="$HOME/.my.cnf" "${sdb}"
-  mysql --defaults-file="$HOME/.my.cnf" -e "GRANT ALL PRIVILEGES ON \`${sdb}\`.* TO '${db_user}'@'localhost'; FLUSH PRIVILEGES;"
+  mysql_exec "CREATE DATABASE \`${sdb}\`;"
+  mysqldump_pipe_restore "${db_name}" "${sdb}"
+  mysql_exec "GRANT ALL PRIVILEGES ON \`${sdb}\`.* TO '${db_user}'@'localhost'; FLUSH PRIVILEGES;"
 
   log "Pointing staging to new DB..."
   sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set DB_NAME "$sdb" --path="$td"
@@ -934,17 +948,14 @@ main_menu() {
 
 # ------------------------------- Entry ----------------------------------------
 main() {
-  # FAST PATH: if called with 'menu', open the menu and exit (no bootstrap).
   if [[ "${1:-}" == "menu" ]]; then
     main_menu
     exit 0
   fi
 
-  # CRON entry points
   if [[ "${1:-}" == "backup-all" ]]; then backup_all_sites; exit 0; fi
   if [[ "${1:-}" == "remove-site-silent" && -n "${2:-}" ]]; then remove_site_silent "$2"; exit 0; fi
 
-  # First-time bootstrap (only when not launched via `menu`)
   require_sudo
   check_os
   self_install
