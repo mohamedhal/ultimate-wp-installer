@@ -114,11 +114,17 @@ self_install() {
     success "Core script already up-to-date at ${TARGET_SCRIPT}"
   fi
 
-  # Create a stable system-wide launcher
-  if ! command -v woo >/dev/null 2>&1 || ! grep -q "$TARGET_SCRIPT" /usr/local/bin/woo 2>/dev/null; then
-    sudo tee /usr/local/bin/woo >/dev/null <<EOF
+  # Create/refresh the system-wide launcher:
+  # - With arguments: pass-through
+  # - Without arguments: launch menu (no bootstrap)
+  if [[ ! -f /usr/local/bin/woo ]] || ! grep -q "/opt/woo/woo.sh" /usr/local/bin/woo; then
+    sudo tee /usr/local/bin/woo >/dev/null <<'EOF'
 #!/usr/bin/env bash
-exec bash "${TARGET_SCRIPT}" "\$@"
+if [[ $# -gt 0 ]]; then
+  exec bash /opt/woo/woo.sh "$@"
+else
+  exec bash /opt/woo/woo.sh menu
+fi
 EOF
     sudo chmod +x /usr/local/bin/woo
     success "System-wide 'woo' command installed at /usr/local/bin/woo"
@@ -616,7 +622,12 @@ remove_site() {
   local domain; domain=$(select_site) || return
   warn "This will permanently delete ${domain} (files, DB, users, config)."
   read -rp "Type the domain to confirm: " confirm
-  [[ "$confirm" == "$domain" ]] || { warn "Confirmation mismatch. Aborted."; return; }
+  # ---- FIX: tolerant confirmation (trims whitespace) ----
+  local clean_confirm clean_domain
+  clean_confirm="$(echo -n "$confirm" | tr -d ' \t\r\n')"
+  clean_domain="$(echo -n "$domain" | tr -d ' \t\r\n')"
+  [[ "$clean_confirm" == "$clean_domain" ]] || { warn "Confirmation mismatch. Aborted."; return; }
+
   remove_site_silent "$domain"
   success "Site ${domain} removed."
 }
@@ -932,13 +943,19 @@ main_menu() {
 
 # ------------------------------- Entry ----------------------------------------
 main() {
+  # Fast path: if asked for menu, just open it and exit (no bootstrap).
+  if [[ "${1:-}" == "menu" ]]; then
+    main_menu
+    exit 0
+  fi
+
   # CRON entry points (use the persistent copy path)
   if [[ "${1:-}" == "backup-all" ]]; then backup_all_sites; exit 0; fi
   if [[ "${1:-}" == "remove-site-silent" && -n "${2:-}" ]]; then remove_site_silent "$2"; exit 0; fi
 
   require_sudo
   check_os
-  self_install            # <— makes /opt/woo/woo.sh and /usr/local/bin/woo permanent
+  self_install            # ensures /opt/woo/woo.sh and `woo` launcher
   ensure_swap_if_low_ram
   install_dependencies
   configure_nginx_includes
