@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# WOO v12 — WordPress Ultimate Operations (The Phoenix, Hardened)
+# WOO v12.1 — WordPress Ultimate Operations (Self-Installing)
 # Target: Ubuntu 22.04/24.04 LTS (OVH, user=ubuntu with sudo)
-# Design: Zero-fail, idempotent, run-and-forget server bootstrap + menu toolkit
+# Design: Zero-fail, idempotent, run-and-forget + permanent `woo` launcher
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -31,7 +31,9 @@ readonly WEBROOT="${WEBROOT:-/var/www}"
 readonly MIN_RAM=2048          # MB
 readonly F2B_MAXRETRY=5
 readonly F2B_BANTIME="1d"
-readonly SCRIPT_PATH="$(realpath "$0")"
+readonly SCRIPT_PATH="$(realpath "$0" 2>/dev/null || echo "$0")"
+readonly INSTALL_DIR="/opt/woo"
+readonly TARGET_SCRIPT="${INSTALL_DIR}/woo.sh"
 readonly CONFIG_DIR="$HOME/.woo-toolkit"
 readonly BACKUP_CONFIG_FILE="$CONFIG_DIR/backup.conf"
 readonly XMLRPC_WHITELIST_FILE="/etc/nginx/conf.d/xmlrpc_whitelist.conf"
@@ -99,6 +101,33 @@ ensure_swap_if_low_ram() {
   fi
 }
 
+# ------------------------- Self-Install (permanent woo) -----------------------
+self_install() {
+  # Always ensure a permanent copy exists, even if script was run via a pipe (/dev/fd/*)
+  sudo mkdir -p "$INSTALL_DIR"
+  # Copy current running script source to TARGET_SCRIPT
+  # Using cat "$0" works for files and /dev/fd/* while the process is alive
+  if ! sudo cmp -s <(cat "$0") "$TARGET_SCRIPT" 2>/dev/null; then
+    cat "$0" | sudo tee "$TARGET_SCRIPT" >/dev/null
+    sudo chmod +x "$TARGET_SCRIPT"
+    success "Installed/updated core script at ${TARGET_SCRIPT}"
+  else
+    success "Core script already up-to-date at ${TARGET_SCRIPT}"
+  fi
+
+  # Create a stable system-wide launcher
+  if ! command -v woo >/dev/null 2>&1 || ! grep -q "$TARGET_SCRIPT" /usr/local/bin/woo 2>/dev/null; then
+    sudo tee /usr/local/bin/woo >/dev/null <<EOF
+#!/usr/bin/env bash
+exec bash "${TARGET_SCRIPT}" "\$@"
+EOF
+    sudo chmod +x /usr/local/bin/woo
+    success "System-wide 'woo' command installed at /usr/local/bin/woo"
+  else
+    success "'woo' launcher already present."
+  fi
+}
+
 # ------------------------------ Bootstrap -------------------------------------
 add_ppa_once() {
   local ppa="$1"
@@ -109,8 +138,7 @@ add_ppa_once() {
 install_dependencies() {
   log "Installing core packages..."
   sudo apt-get update -y
-  sudo apt-get install -y software-properties-common curl wget unzip git rsync psmisc dnsutils gnupg ca-certificates ufw \
-    || true
+  sudo apt-get install -y software-properties-common curl wget unzip git rsync psmisc dnsutils gnupg ca-certificates ufw || true
 
   add_ppa_once "ondrej/php"
   add_ppa_once "ondrej/nginx"
@@ -252,23 +280,11 @@ EOF
 }
 
 setup_alias() {
-  # Ensure alias for both current user and root (if present)
+  # Keep user/root aliases for convenience; launcher makes this optional
   local usr_rc="$HOME/.bashrc"
-  grep -q "alias woo=" "$usr_rc" 2>/dev/null || echo "alias woo='bash ${SCRIPT_PATH}'" >> "$usr_rc"
+  grep -q "alias woo=" "$usr_rc" 2>/dev/null || echo "alias woo='bash ${TARGET_SCRIPT}'" >> "$usr_rc"
   if sudo test -f /root/.bashrc; then
-    sudo grep -q "alias woo=" /root/.bashrc 2>/dev/null || echo "alias woo='bash ${SCRIPT_PATH}'" | sudo tee -a /root/.bashrc >/dev/null
-  fi
-}
-
-# NEW: system-wide launcher so `woo` always works
-install_launcher() {
-  if ! command -v woo >/dev/null 2>&1 || ! grep -q "$SCRIPT_PATH" /usr/local/bin/woo 2>/dev/null; then
-    sudo tee /usr/local/bin/woo >/dev/null <<EOF
-#!/usr/bin/env bash
-exec bash "${SCRIPT_PATH}" "\$@"
-EOF
-    sudo chmod +x /usr/local/bin/woo
-    success "System-wide 'woo' command installed at /usr/local/bin/woo"
+    sudo grep -q "alias woo=" /root/.bashrc 2>/dev/null || echo "alias woo='bash ${TARGET_SCRIPT}'" | sudo tee -a /root/.bashrc >/dev/null
   fi
 }
 
@@ -415,7 +431,6 @@ EOF
   success "Credentials saved to $cred_file"
 }
 
-# NEW: Post-install provision report (printed + saved)
 print_site_report() {
   local domain="$1" admin_user="$2" admin_pass="$3" db_name="$4" db_user="$5" db_pass="$6" admin_email="$7" site_dir="$8"
   local report_dir="$HOME/woo_credentials"
@@ -427,19 +442,10 @@ print_site_report() {
   local cache_tip="Disabled (enable via: Menu → Manage Site Caching)"
 
   mkdir -p "$report_dir"
-
-  # Detect SSL (best-effort)
-  if [ -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]; then
-    cert_status="Active"
-  fi
-
-  # Detect FastCGI cache in vhost
-  if grep -q "fastcgi_cache WORDPRESS;" "$nginx_vhost" 2>/dev/null; then
-    cache_tip="Enabled (you can toggle from the menu)"
-  fi
+  if [ -f "/etc/letsencrypt/live/${domain}/fullchain.pem" ]; then cert_status="Active"; fi
+  if grep -q "fastcgi_cache WORDPRESS;" "$nginx_vhost" 2>/dev/null; then cache_tip="Enabled (you can toggle from the menu)"; fi
 
   local box_line="================================================================================"
-
   tee "$report_file" >/dev/null <<EOF
 $box_line
 WOO Site Provision Report — ${domain}
@@ -510,20 +516,13 @@ install_standard_site() {
 
 install_multisite() {
   local domain="$1" site_dir="$2" admin_user="$3" admin_pass="$4" admin_email="$5"
-
   sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set WP_ALLOW_MULTISITE true --raw --path="$site_dir"
-
-  # Default to subdirectory; switch to subdomain if wildcard seems present
   local subdomains_flag=""
-  if dig +short "wildcard-check.${domain}" | grep -Eq "([0-9]{1,3}\.){3}[0-9]{1,3}"; then
-    subdomains_flag="--subdomains"
-  fi
-
+  if dig +short "wildcard-check.${domain}" | grep -Eq "([0-9]{1,3}\.){3}[0-9]{1,3}"; then subdomains_flag="--subdomains"; fi
   sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp core multisite-install \
     --path="$site_dir" --url="https://${domain}" --title="${domain}" \
     --admin_user="${admin_user}" --admin_password="${admin_pass}" --admin_email="${admin_email}" \
     ${subdomains_flag:+$subdomains_flag}
-
   sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp plugin install redis-cache --activate --network --path="$site_dir"
   sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp redis enable --path="$site_dir"
 }
@@ -550,7 +549,6 @@ add_site() {
     sudo rm -rf "$site_dir"
   fi
 
-  # DB + user
   local db_name="wp_$(echo "$domain" | tr '.' '_' | cut -c 1-20)_$(openssl rand -hex 4)"
   local db_user="usr_$(openssl rand -hex 6)"
   local db_pass; db_pass="$(openssl rand -base64 24)"
@@ -620,7 +618,6 @@ remove_site() {
   warn "This will permanently delete ${domain} (files, DB, users, config)."
   read -rp "Type the domain to confirm: " confirm
   [[ "$confirm" == "$domain" ]] || { warn "Confirmation mismatch. Aborted."; return; }
-
   remove_site_silent "$domain"
   success "Site ${domain} removed."
 }
@@ -735,7 +732,7 @@ configure_scheduled_backups() {
   clear; echo -e "${BLUE}--- Scheduled Backups ---${NC}\n"
   read -rp "Enable daily backups at 02:00? (y/N): " a
   if [[ "${a,,}" != "y" ]]; then
-    (crontab -l 2>/dev/null | grep -v "${SCRIPT_PATH} backup-all") | crontab - || true
+    (crontab -l 2>/dev/null | grep -v "${TARGET_SCRIPT} backup-all") | crontab - || true
     success "Scheduled backups disabled."
     return
   fi
@@ -751,7 +748,8 @@ configure_scheduled_backups() {
     rm -f "$BACKUP_CONFIG_FILE" || true
   fi
 
-  (crontab -l 2>/dev/null | grep -v "${SCRIPT_PATH} backup-all"; echo "0 2 * * * bash ${SCRIPT_PATH} backup-all") | crontab -
+  # Use TARGET_SCRIPT so cron always runs the persistent copy
+  (crontab -l 2>/dev/null | grep -v "${TARGET_SCRIPT} backup-all"; echo "0 2 * * * bash ${TARGET_SCRIPT} backup-all") | crontab -
   success "Daily backups scheduled."
 }
 
@@ -935,12 +933,13 @@ main_menu() {
 
 # ------------------------------- Entry ----------------------------------------
 main() {
-  # CRON entry points
+  # CRON entry points (use the persistent copy path)
   if [[ "${1:-}" == "backup-all" ]]; then backup_all_sites; exit 0; fi
   if [[ "${1:-}" == "remove-site-silent" && -n "${2:-}" ]]; then remove_site_silent "$2"; exit 0; fi
 
   require_sudo
   check_os
+  self_install            # <— makes /opt/woo/woo.sh and /usr/local/bin/woo permanent
   ensure_swap_if_low_ram
   install_dependencies
   configure_nginx_includes
@@ -948,7 +947,6 @@ main() {
   configure_tuned_mariadb
   harden_server
   setup_alias
-  install_launcher   # NEW: make `woo` available system-wide
 
   success "Initial server setup complete."
   main_menu
