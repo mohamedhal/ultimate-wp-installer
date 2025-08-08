@@ -1,338 +1,269 @@
 #!/usr/bin/env bash
-# ============================================================================
-# WOO v12 — WordPress Operations Orchestrator (Interactive, One-Command)
-# Target: Ubuntu 22.04 / 24.04 LTS
-#
-# - Run once to set up the server. After that, just type `woo` for the menu.
-# - Always installs the latest stable PHP from Ondřej’s PPA (tries 8.3, falls back to 8.2).
-# - Per-site isolation: separate PHP-FPM pool, DB+user, Nginx vhost, filesystem.
-# - No Multisite, No Staging, No Cloudflare, No remote backups (local only).
-# - XML-RPC kept ON but protected by a global whitelist (for Odoo).
-# - Smart, safe, zero-fail mindset with rollback on errors and clear reports.
-# ============================================================================
+# ==============================================================================
+# WOO v12 — WordPress Ultimate Operations (The Phoenix, Hardened)
+# Target: Ubuntu 22.04/24.04 LTS (OVH, user=ubuntu with sudo)
+# Design: Zero-fail, idempotent, run-and-forget server bootstrap + menu toolkit
+# ==============================================================================
 
-set -euo pipefail
+set -Eeuo pipefail
 IFS=$'\n\t'
 
-# --------------------------- Auto-sudo (OVH-friendly) -----------------------
-if [ "${EUID:-$(id -u)}" -ne 0 ]; then
-  exec sudo -E bash "$0" "$@"
-fi
-
-# --------------------------- Colors & Log -----------------------------------
-c_blue='\033[0;34m'; c_green='\033[0;32m'; c_yellow='\033[1;33m'; c_red='\033[0;31m'; c_nc='\033[0m'
+# --------------------------- Colors & Logging ---------------------------------
+readonly RED='\033[0;31m'; readonly GREEN='\033[0;32m'; readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'; readonly NC='\033[0m'
 readonly LOG_DIR="/var/log/woo-toolkit"
-readonly LOG_FILE="${LOG_DIR}/woo-$(date +%Y%m%d_%H%M%S).log"
-mkdir -p "$LOG_DIR"; touch "$LOG_FILE"
+readonly LOG_FILE="${LOG_DIR}/woo-run-$(date +%Y%m%d_%H%M%S).log"
 
-log()  { echo -e "${c_blue}[$(date '+%F %T')]${c_nc} $*" | tee -a "$LOG_FILE"; }
-ok()   { echo -e "${c_green}✓${c_nc} $*" | tee -a "$LOG_FILE"; }
-warn() { echo -e "${c_yellow}‼${c_nc} $*" | tee -a "$LOG_FILE"; }
-fail(){ echo -e "${c_red}✗${c_nc} $*" | tee -a "$LOG_FILE"; exit 1; }
+_log() {
+  local msg="${1:-}"
+  sudo mkdir -p "$LOG_DIR" >/dev/null 2>&1 || true
+  sudo touch "$LOG_FILE" >/dev/null 2>&1 || true
+  echo "[$(date '+%F %T')] $msg" | sudo tee -a "$LOG_FILE" >/dev/null || true
+}
+log()     { echo -e "${BLUE}[$(date '+%F %T')]${NC} $1"; _log "$1"; }
+success() { echo -e "${GREEN}✓${NC} $1"; _log "OK: $1"; }
+warn()    { echo -e "${YELLOW}‼${NC} $1"; _log "WARN: $1"; }
+fail()    { echo -e "${RED}✗${NC} $1"; _log "ERR: $1"; exit 1; }
 
-trap 'error_handler $LINENO "$BASH_COMMAND"' ERR
-
-# --------------------------- Global Defaults --------------------------------
-readonly WEBROOT="/var/www"
-readonly CONFIG_DIR="/etc/woo"
-readonly PHP_CANDIDATES=("8.3" "8.2")
-PHP_VERSION=""
-readonly MIN_RAM_MB=2048
-readonly MIN_DISK_MB=10240
+# ------------------------------ Globals ---------------------------------------
+readonly PHP_VERSION="${PHP_VERSION:-8.2}"
+readonly WEBROOT="${WEBROOT:-/var/www}"
+readonly MIN_RAM=2048          # MB
+readonly F2B_MAXRETRY=5
+readonly F2B_BANTIME="1d"
+readonly SCRIPT_PATH="$(realpath "$0")"
+readonly CONFIG_DIR="$HOME/.woo-toolkit"
+readonly BACKUP_CONFIG_FILE="$CONFIG_DIR/backup.conf"
 readonly XMLRPC_WHITELIST_FILE="/etc/nginx/conf.d/xmlrpc_whitelist.conf"
-readonly LIMITS_FILE="/etc/nginx/conf.d/limits.conf"
-readonly CACHE_FILE="/etc/nginx/conf.d/fastcgi_cache.conf"
+declare -A SITE_DATA=()
 
-declare -A CTX=()  # rollback context keys: DOMAIN, SITE_DIR, DB_NAME, DB_USER
+# ------------------------------ Error Handler ---------------------------------
+error_handler() {
+  local line="${1:-?}" cmd="${2:-?}" status="${3:-$?}"
+  log "Critical error at line $line: $cmd (exit $status). Starting rollback..."
 
-# --------------------------- Helpers ----------------------------------------
-have(){ command -v "$1" &>/dev/null; }
-gen_pass(){ openssl rand -base64 "${1:-24}"; }
-rand_hex(){ openssl rand -hex "${1:-6}"; }
-press_any(){ read -n 1 -s -r -p "Press any key to continue..."; echo; }
-
-error_handler(){
-  local l="$1" c="$2"
-  log "Error on line $l: $c"
-  rollback_safe
-  fail "Aborted. See log: $LOG_FILE"
-}
-
-rollback_safe(){
-  if [[ -n "${CTX[DOMAIN]:-}" ]]; then
-    rm -f "/etc/nginx/sites-available/${CTX[DOMAIN]}" "/etc/nginx/sites-enabled/${CTX[DOMAIN]}" || true
-    rm -f "/etc/php/${PHP_VERSION}/fpm/pool.d/${CTX[DOMAIN]}.conf" || true
-    systemctl reload "php${PHP_VERSION}-fpm" nginx || true
+  set +e
+  if [[ -n "${SITE_DATA[DB_NAME]:-}" ]]; then
+    log "Dropping DB: ${SITE_DATA[DB_NAME]}"
+    mysql --defaults-file="$HOME/.my.cnf" -e "DROP DATABASE IF EXISTS ${SITE_DATA[DB_NAME]};" >/dev/null 2>&1 || true
   fi
-  [[ -n "${CTX[DB_NAME]:-}" ]] && mysql --defaults-file=/root/.my.cnf -e "DROP DATABASE IF EXISTS \`${CTX[DB_NAME]}\`;" || true
-  [[ -n "${CTX[DB_USER]:-}" ]] && mysql --defaults-file=/root/.my.cnf -e "DROP USER IF EXISTS '${CTX[DB_USER]}'@'localhost';" || true
-  [[ -n "${CTX[SITE_DIR]:-}" ]] && rm -rf "${CTX[SITE_DIR]}" || true
-}
+  if [[ -n "${SITE_DATA[DB_USER]:-}" ]]; then
+    log "Dropping DB user: ${SITE_DATA[DB_USER]}"
+    mysql --defaults-file="$HOME/.my.cnf" -e "DROP USER IF EXISTS '${SITE_DATA[DB_USER]}'@'localhost';" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${SITE_DATA[SITE_DIR]:-}" ]]; then
+    log "Removing site dir: ${SITE_DATA[SITE_DIR]}"
+    sudo rm -rf "${SITE_DATA[SITE_DIR]}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${SITE_DATA[DOMAIN]:-}" ]]; then
+    log "Removing Nginx/PHP config for ${SITE_DATA[DOMAIN]}"
+    sudo rm -f "/etc/nginx/sites-available/${SITE_DATA[DOMAIN]}" "/etc/nginx/sites-enabled/${SITE_DATA[DOMAIN]}" >/dev/null 2>&1 || true
+    sudo rm -f "/etc/php/${PHP_VERSION}/fpm/pool.d/${SITE_DATA[DOMAIN]}.conf" >/dev/null 2>&1 || true
+  fi
 
-# --------------------------- Preflight & Detection --------------------------
-preflight(){
-  log "Preflight checks…"
+  sudo systemctl restart nginx >/dev/null 2>&1 || true
+  sudo systemctl restart mariadb >/dev/null 2>&1 || true
+  sudo systemctl restart "php${PHP_VERSION}-fpm" >/dev/null 2>&1 || true
+  fail "Installation failed and rollback completed. See log: $LOG_FILE"
+}
+trap 'error_handler "$LINENO" "$BASH_COMMAND" "$?"' ERR
+
+# ---------------------------- Preconditions -----------------------------------
+require_sudo() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    warn "Running as root; continuing, but recommended to use 'ubuntu' with sudo."
+  else
+    sudo -n true 2>/dev/null || { log "Sudo required. Prompting..."; sudo -v || fail "Sudo not available."; }
+  fi
+}
+check_os() {
   [[ -f /etc/os-release ]] || fail "Unsupported OS."
   . /etc/os-release
-  [[ "${NAME}" =~ Ubuntu ]] || fail "Ubuntu required."
-  if [[ "${VERSION_ID}" != "22.04" && "${VERSION_ID}" != "24.04" ]]; then
-    warn "Tested on 22.04/24.04. You are ${VERSION_ID}."
-  fi
-  local free_mb; free_mb=$(df -Pm / | awk 'NR==2 {print $4}')
-  (( free_mb >= MIN_DISK_MB )) || fail "Low disk: ${free_mb}MB (< ${MIN_DISK_MB})."
-  ok "Preflight OK."
+  dpkg --compare-versions "${VERSION_ID}" lt "22.04" && warn "Ubuntu ${VERSION_ID} < 22.04. Proceeding, but only 22.04+ is tested."
+  success "Ubuntu ${VERSION_ID} detected."
 }
-
-ensure_swap(){
+ensure_swap_if_low_ram() {
   local ram_mb; ram_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
-  if (( ram_mb < MIN_RAM_MB )); then
-    warn "RAM ${ram_mb}MB < ${MIN_RAM_MB}MB. Creating 2G swap for stability…"
-    if ! swapon --show | grep -q /swapfile; then
-      fallocate -l 2G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=2048
-      chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
-      grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-      ok "Swap enabled."
+  if (( ram_mb < MIN_RAM )); then
+    if ! sudo swapon --show | grep -q '^/swapfile'; then
+      warn "Low RAM (${ram_mb}MB). Creating 2G swap..."
+      sudo fallocate -l 2G /swapfile 2>/dev/null || sudo dd if=/dev/zero of=/swapfile bs=1M count=2048
+      sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
+      grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
+      success "Swap created."
+    else
+      success "Swap already present."
     fi
+  else
+    success "Sufficient RAM (${ram_mb}MB)."
   fi
 }
 
-select_php_version(){
-  for v in "${PHP_CANDIDATES[@]}"; do
-    if apt-cache policy "php${v}-fpm" | grep -q Candidate; then PHP_VERSION="$v"; break; fi
-  done
-  [[ -n "$PHP_VERSION" ]] || PHP_VERSION="8.2"
-  ok "Using PHP ${PHP_VERSION}."
-}
-
-# --------------------------- Stack Install ----------------------------------
-install_stack(){
-  log "Installing & updating packages…"
-  apt-get update -y
-  apt-get install -y software-properties-common curl wget unzip git rsync psmisc jq dnsutils ca-certificates gnupg lsb-release
-  add-apt-repository -y ppa:ondrej/php
-  add-apt-repository -y ppa:ondrej/nginx
-  apt-get update -y
-
-  select_php_version
-
-  DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    nginx mariadb-server redis-server fail2ban ufw \
-    certbot python3-certbot-nginx unattended-upgrades haveged \
-    php${PHP_VERSION}-fpm php${PHP_VERSION}-mysql php${PHP_VERSION}-curl php${PHP_VERSION}-mbstring php${PHP_VERSION}-xml \
-    php${PHP_VERSION}-zip php${PHP_VERSION}-gd php${PHP_VERSION}-opcache php${PHP_VERSION}-redis php${PHP_VERSION}-imagick php${PHP_VERSION}-bcmath
-
-  if ! have wp; then
-    curl -fsSL -o /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
-    chmod +x /usr/local/bin/wp
+# ------------------------------ Bootstrap -------------------------------------
+add_ppa_once() {
+  local ppa="$1"
+  if ! grep -Rq "^deb .*$ppa" /etc/apt/sources.list.d /etc/apt/sources.list 2>/dev/null; then
+    sudo add-apt-repository -y "ppa:$ppa" || true
   fi
-  ok "Stack installed."
+}
+install_dependencies() {
+  log "Installing core packages..."
+  sudo apt-get update -y
+  sudo apt-get install -y software-properties-common curl wget unzip git rsync psmisc dnsutils gnupg ca-certificates ufw \
+    || true
+
+  add_ppa_once "ondrej/php"
+  add_ppa_once "ondrej/nginx"
+  sudo apt-get update -y
+
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    nginx mariadb-server redis-server fail2ban certbot python3-certbot-nginx postfix unattended-upgrades haveged \
+    "php${PHP_VERSION}-fpm" "php${PHP_VERSION}-mysql" "php${PHP_VERSION}-curl" "php${PHP_VERSION}-mbstring" \
+    "php${PHP_VERSION}-xml" "php${PHP_VERSION}-zip" "php${PHP_VERSION}-gd" "php${PHP_VERSION}-opcache" \
+    "php${PHP_VERSION}-redis" "php${PHP_VERSION}-imagick" "php${PHP_VERSION}-bcmath"
+
+  if ! command -v wp >/dev/null 2>&1; then
+    log "Installing WP-CLI..."
+    curl -fsSL -o /tmp/wp-cli.phar https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+    chmod +x /tmp/wp-cli.phar && sudo mv /tmp/wp-cli.phar /usr/local/bin/wp
+  fi
+
+  # unattended upgrades
+  echo 'APT::Periodic::Update-Package-Lists "1";' | sudo tee /etc/apt/apt.conf.d/20auto-upgrades >/dev/null
+  echo 'APT::Periodic::Unattended-Upgrade "1";' | sudo tee -a /etc/apt/apt.conf.d/20auto-upgrades >/dev/null
+
+  success "Dependencies installed."
 }
 
-secure_mariadb(){
-  log "Securing MariaDB…"
-  if [[ -f /root/.my.cnf ]]; then warn "MariaDB already secured. Skipping."; return; fi
-  local pass; pass="$(gen_pass 32)"
-  mysql -u root <<SQL
-ALTER USER 'root'@'localhost' IDENTIFIED BY '${pass}';
+configure_nginx_includes() {
+  # Ensure conf.d is included (Ubuntu default already includes sites-enabled)
+  if ! grep -q 'include /etc/nginx/conf.d/\*\.conf;' /etc/nginx/nginx.conf; then
+    sudo sed -i '/http {/a \    include /etc/nginx/conf.d/*.conf;' /etc/nginx/nginx.conf
+  fi
+
+  # Safe default vhost: return 444
+  sudo tee /etc/nginx/sites-available/default >/dev/null <<'EOF'
+server {
+  listen 80 default_server;
+  listen [::]:80 default_server;
+  server_name _;
+  root /var/www/html;
+  return 444;
+}
+EOF
+  [[ -L /etc/nginx/sites-enabled/default ]] || sudo ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
+  sudo nginx -t && sudo systemctl reload nginx
+}
+
+configure_tuned_mariadb() {
+  log "Tuning MariaDB..."
+  local total_ram_kb; total_ram_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+  local ibp=$(( total_ram_kb / 4 ))
+  (( ibp > 4194304 )) && ibp=4194304
+  sudo tee /etc/mysql/mariadb.conf.d/99-woo-tuned.cnf >/dev/null <<EOF
+[mysqld]
+innodb_buffer_pool_size = ${ibp}K
+innodb_log_file_size = 256M
+innodb_file_per_table = 1
+max_allowed_packet = 256M
+EOF
+  sudo systemctl restart mariadb
+  success "MariaDB tuned."
+}
+
+secure_mysql() {
+  log "Securing MariaDB..."
+  # If ~/.my.cnf exists, assume already secured
+  if [[ -f "$HOME/.my.cnf" ]]; then success "MariaDB already secured."; return; fi
+
+  # Try socket login first (fresh installs)
+  if sudo mysql -e "SELECT 1" >/dev/null 2>&1; then
+    local db_root_pass; db_root_pass="$(openssl rand -base64 32)"
+    sudo mysql <<EOF
+ALTER USER 'root'@'localhost' IDENTIFIED BY '${db_root_pass}';
 DELETE FROM mysql.user WHERE User='';
 DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost','127.0.0.1','::1');
 DROP DATABASE IF EXISTS test;
 FLUSH PRIVILEGES;
-SQL
-  cat >/root/.my.cnf <<EOF
-[client]
-user=root
-password=${pass}
 EOF
-  chmod 600 /root/.my.cnf
-  ok "MariaDB secured."
-}
-
-tune_mariadb(){
-  log "Tuning MariaDB…"
-  local ram_kb ib_k ib
-  ram_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
-  ib_k=$(( ram_kb / 4 )); if (( ib_k > 4194304 )); then ib="4096M"; else ib="${ib_k}K"; fi
-  cat >/etc/mysql/mariadb.conf.d/99-woo-tuned.cnf <<EOF
-[mysqld]
-innodb_buffer_pool_size=${ib}
-innodb_log_file_size=256M
-innodb_file_per_table=1
-max_allowed_packet=256M
-tmp_table_size=128M
-max_heap_table_size=128M
-innodb_flush_log_at_trx_commit=1
-EOF
-  systemctl restart mariadb
-  ok "MariaDB tuned."
-}
-
-harden_php(){
-  log "Hardening PHP ${PHP_VERSION}…"
-  mkdir -p "/etc/php/${PHP_VERSION}/fpm/conf.d"
-  cat >"/etc/php/${PHP_VERSION}/fpm/conf.d/99-woo-opcache.ini" <<EOF
-opcache.enable=1
-opcache.enable_cli=1
-opcache.memory_consumption=256
-opcache.interned_strings_buffer=16
-opcache.max_accelerated_files=100000
-opcache.validate_timestamps=0
-opcache.jit=1255
-opcache.jit_buffer_size=64M
-realpath_cache_size=4096k
-realpath_cache_ttl=600
-EOF
-  sed -i 's/^expose_php = On/expose_php = Off/' "/etc/php/${PHP_VERSION}/fpm/php.ini" || true
-  sed -i 's/;cgi.fix_pathinfo=1/cgi.fix_pathinfo=0/' "/etc/php/${PHP_VERSION}/fpm/php.ini" || true
-  systemctl restart "php${PHP_VERSION}-fpm"
-  ok "PHP hardened."
-}
-
-harden_imagick(){
-  log "Applying safe ImageMagick policy…"
-  local pol="/etc/ImageMagick-6/policy.xml"; [[ -f "$pol" ]] || pol="/etc/ImageMagick/policy.xml"
-  if [[ -f "$pol" ]]; then
-    cp "$pol" "${pol}.bak.$(date +%s)" || true
-    if ! grep -q 'policy domain="resource" name="memory"' "$pol"; then
-      cat >>"$pol" <<'EOF'
-<policymap>
-  <policy domain="resource" name="memory" value="512MiB"/>
-  <policy domain="resource" name="map" value="1GiB"/>
-  <policy domain="resource" name="width" value="8000"/>
-  <policy domain="resource" name="height" value="8000"/>
-  <policy domain="coder" rights="none" pattern="PDF"/>
-  <policy domain="coder" rights="none" pattern="PS"/>
-</policymap>
-EOF
-    fi
+    printf "[client]\nuser=root\npassword=%s\n" "$db_root_pass" > "$HOME/.my.cnf"
+    chmod 600 "$HOME/.my.cnf"
+    success "MariaDB secured; credentials written to ~/.my.cnf"
+  else
+    warn "Could not connect to MariaDB via socket; assuming already secured."
   fi
 }
 
-harden_firewall_fail2ban(){
-  log "UFW + Fail2Ban…"
-  ufw default deny incoming || true
-  ufw default allow outgoing || true
-  ufw allow OpenSSH || true
-  ufw allow 'Nginx Full' || true
-  echo "y" | ufw enable || true
+harden_server() {
+  log "Hardening server..."
 
-  cat >/etc/fail2ban/jail.d/wordpress.conf <<EOF
+  # UFW
+  if ! sudo ufw status | grep -q "Status: active"; then
+    sudo ufw default deny incoming || true
+    sudo ufw default allow outgoing || true
+    sudo ufw allow OpenSSH || true
+    sudo ufw allow 'Nginx Full' || true
+    echo "y" | sudo ufw enable || true
+  fi
+
+  # Fail2Ban
+  sudo tee /etc/fail2ban/jail.d/wordpress.conf >/dev/null <<EOF
 [sshd]
 enabled = true
 maxretry = 3
-bantime = 1d
+bantime = ${F2B_BANTIME}
 
-[nginx-wp-login]
-enabled = true
-filter = nginx-wp-login
-logpath = /var/log/nginx/*access.log
-maxretry = 10
-findtime = 600
-bantime = 1d
-
-[nginx-xmlrpc]
-enabled = true
-filter = nginx-xmlrpc
-logpath = /var/log/nginx/*access.log
-maxretry = 20
-findtime = 600
-bantime = 1d
+[wordpress-hard]
+enabled  = true
+filter   = wordpress-hard
+logpath  = /var/log/nginx/*access.log
+maxretry = ${F2B_MAXRETRY}
+bantime  = ${F2B_BANTIME}
+port     = http,https
 EOF
 
-  cat >/etc/fail2ban/filter.d/nginx-wp-login.conf <<'EOF'
+  sudo tee /etc/fail2ban/filter.d/wordpress-hard.conf >/dev/null <<'EOF'
 [Definition]
-failregex = <HOST> - .* "(POST|GET) /wp-login.php
+failregex = ^<HOST> - - \[.*\] "POST /wp-login\.php
+            ^<HOST> - - \[.*\] "GET /wp-login\.php
+            ^<HOST> - - \[.*\] "POST /xmlrpc\.php
 ignoreregex =
 EOF
+  sudo systemctl restart fail2ban || true
 
-  cat >/etc/fail2ban/filter.d/nginx-xmlrpc.conf <<'EOF'
-[Definition]
-failregex = <HOST> - .* "POST /xmlrpc.php
-ignoreregex =
-EOF
+  # PHP hardening (robust sed)
+  sudo sed -i -E 's@^;?\s*expose_php\s*=\s*On@expose_php = Off@' "/etc/php/${PHP_VERSION}/fpm/php.ini" || true
+  sudo sed -i -E 's@^;?\s*cgi\.fix_pathinfo\s*=\s*1@cgi.fix_pathinfo=0@' "/etc/php/${PHP_VERSION}/fpm/php.ini" || true
+  sudo systemctl restart "php${PHP_VERSION}-fpm" || true
 
-  systemctl restart fail2ban || true
-}
-
-nginx_global(){
-  log "Writing global Nginx configs (limits, cache, xmlrpc whitelist, default)…"
-  cat >"$LIMITS_FILE" <<'EOF'
-limit_req_zone $binary_remote_addr zone=logins:10m rate=5r/m;
-limit_req_zone $binary_remote_addr zone=xmlrpc:10m rate=10r/m;
-limit_conn_zone $binary_remote_addr zone=perip:10m;
-EOF
-
-  cat >"$CACHE_FILE" <<'EOF'
-fastcgi_cache_path /var/run/nginx-cache levels=1:2 keys_zone=WORDPRESS:100m inactive=60m;
-fastcgi_cache_key "$scheme$request_method$host$request_uri";
-fastcgi_cache_use_stale error timeout invalid_header http_500;
-fastcgi_ignore_headers Cache-Control Expires Set-Cookie;
-EOF
-
-  cat >"$XMLRPC_WHITELIST_FILE" <<'EOF'
-# Global XML-RPC whitelist for all sites (0 = blocked by default)
+  # XML-RPC whitelist map
+  if [[ ! -f "$XMLRPC_WHITELIST_FILE" ]]; then
+    sudo tee "$XMLRPC_WHITELIST_FILE" >/dev/null <<'EOF'
+# Managed by WOO Toolkit
 geo $xmlrpc_allowed {
     default 0;
-    # Add IPs via the WOO menu -> XML-RPC whitelist
-    # Example: 203.0.113.10 1;
+    # Add IPs below as: 1.2.3.4 1;
 }
 EOF
+  fi
+  sudo nginx -t && sudo systemctl reload nginx || true
 
-  cat >/etc/nginx/sites-available/default <<'EOF'
-server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
-    server_name _;
-    return 444;
-}
-EOF
-  ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
-  nginx -t && systemctl reload nginx
+  success "Hardening applied."
 }
 
-systemd_logrotate(){
-  log "Systemd & logrotate…"
-  mkdir -p /etc/systemd/system/nginx.service.d
-  cat >/etc/systemd/system/nginx.service.d/override.conf <<'EOF'
-[Service]
-Restart=always
-RestartSec=2
-LimitNOFILE=100000
-EOF
-  systemctl daemon-reload
-  systemctl restart nginx
-
-  cat >/etc/logrotate.d/woo-nginx <<'EOF'
-/var/log/nginx/*.log {
-  daily
-  rotate 14
-  compress
-  missingok
-  notifempty
-  create 0640 www-data adm
-  sharedscripts
-  postrotate
-    [ -s /run/nginx.pid ] && kill -USR1 `cat /run/nginx.pid`
-  endscript
-}
-EOF
-
-  cat >/etc/logrotate.d/woo-phpfpm <<'EOF'
-/var/log/php-fpm/*.log {
-  daily
-  rotate 14
-  compress
-  missingok
-  notifempty
-  create 0640 www-data adm
-}
-EOF
+setup_alias() {
+  # Ensure alias for both current user and root (if present)
+  local usr_rc="$HOME/.bashrc"
+  grep -q "alias woo=" "$usr_rc" 2>/dev/null || echo "alias woo='bash ${SCRIPT_PATH}'" >> "$usr_rc"
+  if sudo test -f /root/.bashrc; then
+    sudo grep -q "alias woo=" /root/.bashrc 2>/dev/null || echo "alias woo='bash ${SCRIPT_PATH}'" | sudo tee -a /root/.bashrc >/dev/null
+  fi
 }
 
-# --------------------------- Per-Site Functions -----------------------------
-php_pool_create(){
+# --------------------------- Site Operations ----------------------------------
+create_php_pool() {
   local domain="$1"
-  cat >"/etc/php/${PHP_VERSION}/fpm/pool.d/${domain}.conf" <<EOF
+  sudo tee "/etc/php/${PHP_VERSION}/fpm/pool.d/${domain}.conf" >/dev/null <<EOF
 [${domain}]
 user = www-data
 group = www-data
@@ -349,131 +280,206 @@ php_admin_flag[log_errors] = on
 php_value[session.save_handler] = redis
 php_value[session.save_path] = "tcp://127.0.0.1:6379"
 EOF
-  mkdir -p /var/log/php-fpm
-  touch "/var/log/php-fpm/${domain}-error.log" "/var/log/php-fpm/${domain}-slow.log"
-  chown -R www-data:www-data /var/log/php-fpm
-  systemctl restart "php${PHP_VERSION}-fpm"
+  sudo mkdir -p /var/log/php-fpm
+  sudo touch "/var/log/php-fpm/${domain}-error.log" "/var/log/php-fpm/${domain}-slow.log"
+  sudo chown -R www-data:www-data /var/log/php-fpm || true
+  sudo systemctl restart "php${PHP_VERSION}-fpm"
 }
 
-nginx_site_write(){
-  local domain="$1" docroot="$2" cache_on="$3"
-  local cache_block=""
-  if [[ "$cache_on" == "on" ]]; then
-    cache_block=$(cat <<'EOS'
+configure_nginx_site() {
+  local domain="$1" enable_cache="${2:-false}"
+  local config_file="/etc/nginx/sites-available/${domain}"
+
+  local cache_config=""
+  if [[ "$enable_cache" == "true" ]]; then
+    cache_config=$(cat <<'EOF'
 set $skip_cache 0;
 if ($request_method = POST) { set $skip_cache 1; }
 if ($query_string != "") { set $skip_cache 1; }
 if ($request_uri ~* "/wp-admin/|/xmlrpc.php|wp-.*.php|/feed/|index.php|sitemap(_index)?.xml") { set $skip_cache 1; }
 if ($http_cookie ~* "comment_author|wordpress_logged_in|wp-postpass") { set $skip_cache 1; }
+fastcgi_cache_path /var/run/nginx-cache levels=1:2 keys_zone=WORDPRESS:100m inactive=60m;
+fastcgi_cache_key "$scheme$request_method$host$request_uri";
+fastcgi_cache_use_stale error timeout invalid_header http_500;
+fastcgi_ignore_headers Cache-Control Expires Set-Cookie;
 fastcgi_cache WORDPRESS;
 fastcgi_cache_valid 200 60m;
 fastcgi_cache_bypass $skip_cache;
 fastcgi_no_cache $skip_cache;
-EOS
+EOF
 )
   fi
 
-  cat >"/etc/nginx/sites-available/${domain}" <<EOF
-server {
-    listen 443 ssl http2;
-    server_name ${domain} www.${domain};
-    root ${docroot};
-    index index.php;
-
-    ssl_certificate     /etc/letsencrypt/live/${domain}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
-    ssl_protocols TLSv1.3;
-    ssl_prefer_server_ciphers on;
-
-    add_header X-Frame-Options "SAMEORIGIN" always;
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-    add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
-
-    include ${LIMITS_FILE};
-
-    ${cache_block}
-
-    location / { try_files \$uri \$uri/ /index.php\$is_args\$args; }
-
-    location = /wp-login.php {
-        limit_req zone=logins burst=10 nodelay;
-        include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/run/php/php${PHP_VERSION}-${domain}.sock;
-    }
-
-    location = /xmlrpc.php {
-        if (\$xmlrpc_allowed = 0) { return 403; }
-        limit_req zone=xmlrpc burst=20 nodelay;
-        include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/run/php/php${PHP_VERSION}-${domain}.sock;
-    }
-
-    location ~ \.php\$ {
-        include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/run/php/php${PHP_VERSION}-${domain}.sock;
-        limit_conn perip 20;
-    }
-
-    location ~* /(?:uploads|files)/.*\.php\$ { deny all; }
-    location ~* \.(bak|config|sql|fla|psd|ini|log|sh|inc|swp|dist)\$ { deny all; }
-    location ~ /\. { deny all; }
-    location = /readme.html { deny all; }
-    location = /license.txt { deny all; }
-}
-server {
-    listen 80;
-    server_name ${domain} www.${domain};
-    return 301 https://\$host\$request_uri;
+  # Multisite rewrite rules (auto-detect)
+  local multisite_rules=""
+  if sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp core is-installed --network --path="${WEBROOT}/${domain}" >/dev/null 2>&1; then
+    if sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get SUBDOMAIN_INSTALL --path="${WEBROOT}/${domain}" --quiet >/dev/null 2>&1; then
+      multisite_rules=$(cat <<'EOF'
+if (!-e $request_filename) {
+    rewrite /wp-admin$ $scheme://$host$uri/ permanent;
+    rewrite ^/([_0-9a-zA-Z-]+/)?(wp-(content|admin|includes).*) /$2 last;
+    rewrite ^/([_0-9a-zA-Z-]+/)?(.*\.php)$ /$2 last;
+    rewrite /. /index.php last;
 }
 EOF
-  ln -sf "/etc/nginx/sites-available/${domain}" "/etc/nginx/sites-enabled/${domain}"
-  nginx -t && systemctl reload nginx
+)
+    else
+      multisite_rules=$(cat <<'EOF'
+if (!-e $request_filename) {
+    rewrite /wp-admin$ $scheme://$host$uri/ permanent;
+    rewrite ^/[_0-9a-zA-Z-]+/(wp-(content|admin|includes).*) /$1 last;
+    rewrite ^/[_0-9a-zA-Z-]+/(.*\.php)$ /$1 last;
+    rewrite /. /index.php last;
+}
+EOF
+)
+    fi
+  fi
+
+  # IMPORTANT: Emit only port 80 here; Certbot will add SSL later
+  sudo tee "$config_file" >/dev/null <<EOF
+server {
+  listen 80;
+  server_name ${domain} www.${domain};
+  root ${WEBROOT}/${domain};
+  index index.php;
+
+  add_header X-Frame-Options "SAMEORIGIN" always;
+  add_header X-Content-Type-Options "nosniff" always;
+  add_header X-XSS-Protection "1; mode=block" always;
+  add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+  add_header Content-Security-Policy "upgrade-insecure-requests;" always;
+
+  ${cache_config}
+
+  location / { try_files \$uri \$uri/ /index.php\$is_args\$args; }
+  ${multisite_rules}
+
+  location ~ \.php\$ {
+    include snippets/fastcgi-php.conf;
+    fastcgi_pass unix:/run/php/php${PHP_VERSION}-${domain}.sock;
+  }
+
+  location = /xmlrpc.php {
+    if (\$xmlrpc_allowed = 0) { return 403; }
+    include snippets/fastcgi-php.conf;
+    fastcgi_pass unix:/run/php/php${PHP_VERSION}-${domain}.sock;
+  }
+
+  location ~* /(?:uploads|files)/.*\.php\$ { deny all; }
+  location ~* \.(bak|config|sql|fla|psd|ini|log|sh|inc|swp|dist)\$ { deny all; }
+  location ~ /\. { deny all; }
+  location = /readme.html { deny all; }
+  location = /license.txt { deny all; }
+}
+EOF
+
+  [[ -L "/etc/nginx/sites-enabled/${domain}" ]] || sudo ln -s "$config_file" "/etc/nginx/sites-enabled/${domain}"
+  sudo nginx -t && sudo systemctl reload nginx
 }
 
-create_wp_site(){
-  clear; echo -e "${c_green}--- Add New WordPress Site ---${c_nc}\n"
-  read -rp "Domain (example.com): " domain
-  [[ -n "$domain" ]] || { warn "Domain is required."; press_any; return; }
+save_credentials() {
+  local domain="$1" admin_user="$2" admin_pass="$3" db_name="$4" db_user="$5" db_pass="$6"
+  mkdir -p "$HOME/woo_credentials"
+  local cred_file="$HOME/woo_credentials/${domain}.txt"
+  tee "$cred_file" >/dev/null <<EOF
+############################################
+# WordPress Credentials for: ${domain}
+############################################
+
+Site URL: https://${domain}
+Admin URL: https://${domain}/wp-admin
+Admin Username: ${admin_user}
+Admin Password: ${admin_pass}
+
+--------------------------------------------
+
+Database Name: ${db_name}
+Database User: ${db_user}
+Database Pass: ${db_pass}
+############################################
+EOF
+  chmod 600 "$cred_file"
+  success "Credentials saved to $cred_file"
+}
+
+install_standard_site() {
+  local domain="$1" site_dir="$2" admin_user="$3" admin_pass="$4" admin_email="$5"
+  sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp core install \
+    --path="$site_dir" --url="https://${domain}" --title="${domain}" \
+    --admin_user="${admin_user}" --admin_password="${admin_pass}" --admin_email="${admin_email}"
+  sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp plugin install redis-cache --activate --path="$site_dir"
+  sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp redis enable --path="$site_dir"
+}
+
+install_multisite() {
+  local domain="$1" site_dir="$2" admin_user="$3" admin_pass="$4" admin_email="$5"
+
+  sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set WP_ALLOW_MULTISITE true --raw --path="$site_dir"
+
+  # Default to subdirectory; switch to subdomain if wildcard seems present
+  local subdomains_flag=""
+  if dig +short "wildcard-check.${domain}" | grep -Eq "([0-9]{1,3}\.){3}[0-9]{1,3}"; then
+    subdomains_flag="--subdomains"
+  fi
+
+  sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp core multisite-install \
+    --path="$site_dir" --url="https://${domain}" --title="${domain}" \
+    --admin_user="${admin_user}" --admin_password="${admin_pass}" --admin_email="${admin_email}" \
+    ${subdomains_flag:+$subdomains_flag}
+
+  sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp plugin install redis-cache --activate --network --path="$site_dir"
+  sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp redis enable --path="$site_dir"
+}
+
+add_site() {
+  clear; echo -e "${GREEN}--- Add New WordPress Site ---${NC}\n"
+  local domain admin_user admin_email admin_pass site_type
+  read -rp "Domain (e.g., example.com): " domain
+  [[ -n "$domain" ]] || { warn "Domain cannot be empty."; return; }
+
+  read -rp "Admin username (avoid 'admin'): " admin_user
+  [[ -n "$admin_user" ]] || admin_user="siteadmin"
   read -rp "Admin email: " admin_email
-  [[ -n "$admin_email" ]] || { warn "Admin email is required."; press_any; return; }
+  [[ -n "$admin_email" ]] || admin_email="admin@${domain}"
+  admin_pass="$(openssl rand -base64 16)"
+  read -rp "Install type [1=Standard, 2=Multisite] (default 1): " site_type
+  site_type="${site_type:-1}"
 
-  local admin_user=""
-  while true; do
-    read -rp "Admin username (avoid 'admin'): " admin_user
-    [[ -z "$admin_user" ]] && { warn "Username required."; continue; }
-    [[ "$admin_user" == "admin" ]] && { warn "Please choose something other than 'admin'."; continue; }
-    break
-  done
-
-  local admin_pass; admin_pass="$(gen_pass 16)"
   local site_dir="${WEBROOT}/${domain}"
-  [[ -d "$site_dir" ]] && { warn "Directory already exists: ${site_dir}"; press_any; return; }
+  SITE_DATA[DOMAIN]="$domain"; SITE_DATA[SITE_DIR]="$site_dir"
 
-  CTX[DOMAIN]="$domain"; CTX[SITE_DIR]="$site_dir"
+  if [[ -d "$site_dir" ]]; then
+    warn "Directory exists: $site_dir — wiping for fresh install."
+    sudo rm -rf "$site_dir"
+  fi
 
-  mkdir -p "${site_dir}"; chown -R www-data:www-data "${site_dir}"
+  # DB + user
+  local db_name="wp_$(echo "$domain" | tr '.' '_' | cut -c 1-20)_$(openssl rand -hex 4)"
+  local db_user="usr_$(openssl rand -hex 6)"
+  local db_pass; db_pass="$(openssl rand -base64 24)"
+  SITE_DATA[DB_NAME]="$db_name"; SITE_DATA[DB_USER]="$db_user"
 
-  local db_name="wp_$(echo "$domain" | tr '.' '_' | cut -c1-20)_$(rand_hex 4)"
-  local db_user="usr_$(rand_hex 6)"
-  local db_pass; db_pass="$(gen_pass 24)"
-  CTX[DB_NAME]="$db_name"; CTX[DB_USER]="$db_user"
-
-  log "Creating database & user…"
-  mysql --defaults-file=/root/.my.cnf <<SQL
-CREATE DATABASE \`${db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+  log "Creating DB/user..."
+  mysql --defaults-file="$HOME/.my.cnf" <<EOF
+CREATE DATABASE ${db_name} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER '${db_user}'@'localhost' IDENTIFIED BY '${db_pass}';
-GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'localhost';
+GRANT ALL PRIVILEGES ON ${db_name}.* TO '${db_user}'@'localhost';
 FLUSH PRIVILEGES;
-SQL
+EOF
 
-  log "Downloading WordPress core…"
-  sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp core download --path="${site_dir}" --locale=en_US
+  log "Preparing site dir: $site_dir"
+  sudo mkdir -p "$site_dir"
+  sudo chown -R www-data:www-data "$site_dir"
 
-  log "Creating wp-config.php…"
-  local table_prefix="wp_$(rand_hex 3)_"
-  sudo -u www-data wp config create --path="${site_dir}" --dbname="${db_name}" --dbuser="${db_user}" --dbpass="${db_pass}" --dbprefix="${table_prefix}" --extra-php <<PHP
+  log "Downloading WordPress..."
+  sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp core download --path="$site_dir" --locale=en_US
+
+  log "Generating wp-config.php..."
+  local table_prefix="wp_$(openssl rand -hex 3)_"
+  sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config create \
+    --path="$site_dir" --dbname="${db_name}" --dbuser="${db_user}" --dbpass="${db_pass}" --dbprefix="${table_prefix}" \
+    --extra-php <<PHP
 define('WP_CACHE', true);
 define('WP_REDIS_HOST', '127.0.0.1');
 define('WP_REDIS_PORT', 6379);
@@ -484,339 +490,369 @@ define('WP_AUTO_UPDATE_CORE', 'minor');
 define('WP_DEBUG', false);
 define('WP_MEMORY_LIMIT', '128M');
 define('WP_MAX_MEMORY_LIMIT', '256M');
-define('AUTOSAVE_INTERVAL', 120);
-define('WP_POST_REVISIONS', 10);
 PHP
-  sudo -u www-data wp config set WP_CACHE_KEY_SALT "'${domain}'" --path="${site_dir}" --raw
-  sudo -u www-data wp config set DISABLE_WP_CRON true --path="${site_dir}" --raw
+  sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set WP_CACHE_KEY_SALT "'${domain}'" --path="$site_dir" --raw
 
-  log "Installing WordPress (single site)…"
-  sudo -u www-data wp core install --path="${site_dir}" --url="https://${domain}" --title="${domain}" --admin_user="${admin_user}" --admin_password="${admin_pass}" --admin_email="${admin_email}"
-
-  log "Enabling Redis object cache…"
-  sudo -u www-data wp plugin install redis-cache --activate --path="${site_dir}"
-  sudo -u www-data wp redis enable --path="${site_dir}"
-
-  mkdir -p "${site_dir}/wp-content/mu-plugins"
-  cat >"${site_dir}/wp-content/mu-plugins/woo-hardening.php" <<'PHP'
-<?php
-/**
- * MU-hardening for WOO
- */
-add_filter('admin_init', function(){ remove_action('wp_head', 'wp_generator'); });
-add_filter('rest_endpoints', function($endpoints){ unset($endpoints['/wp/v2/users']); return $endpoints; });
-if (!defined('DISALLOW_FILE_EDIT')) define('DISALLOW_FILE_EDIT', true);
-if (!defined('WP_POST_REVISIONS')) define('WP_POST_REVISIONS', 10);
-if (!defined('AUTOSAVE_INTERVAL')) define('AUTOSAVE_INTERVAL', 120);
-PHP
-  chown -R www-data:www-data "${site_dir}"
-
-  php_pool_create "$domain"
-  nginx_site_write "$domain" "$site_dir" "on"
-
-  log "Requesting Let's Encrypt SSL…"
-  if certbot --nginx --hsts --redirect --staple-ocsp -d "$domain" -d "www.${domain}" -m "$admin_email" --agree-tos --non-interactive; then
-    ok "SSL issued."
+  if [[ "$site_type" == "2" ]]; then
+    install_multisite "$domain" "$site_dir" "$admin_user" "$admin_pass" "$admin_email"
   else
-    warn "SSL issuance failed (DNS/ports?). Retry later with: certbot --nginx -d $domain -d www.$domain"
+    install_standard_site "$domain" "$site_dir" "$admin_user" "$admin_pass" "$admin_email"
   fi
 
-  (crontab -l 2>/dev/null | grep -v "wp cron event run --due-now --path=${site_dir}" ; \
-   echo "* * * * * sudo -u www-data WP_CLI_CACHE_DIR=/tmp/wp-cli-cache wp cron event run --due-now --path=${site_dir} >/dev/null 2>&1") | crontab -
+  log "Securing file perms..."
+  sudo find "$site_dir" -type d -exec chmod 755 {} \;
+  sudo find "$site_dir" -type f -exec chmod 644 {} \;
+  sudo chmod 600 "${site_dir}/wp-config.php"
 
-  find "${site_dir}" -type d -exec chmod 755 {} \;
-  find "${site_dir}" -type f -exec chmod 644 {} \;
-  chmod 600 "${site_dir}/wp-config.php"
+  create_php_pool "$domain"
+  configure_nginx_site "$domain" "false"
 
-  mkdir -p /root/woo_credentials
-  local cred="/root/woo_credentials/${domain}.txt"
-  cat >"$cred" <<EOF
-========================================
-WordPress Credentials for: ${domain}
-========================================
-Admin URL: https://${domain}/wp-admin
-Admin User: ${admin_user}
-Admin Pass: ${admin_pass}
+  log "Requesting Let's Encrypt SSL..."
+  if ! sudo certbot --nginx --hsts --staple-ocsp --non-interactive --agree-tos -m "$admin_email" -d "$domain" -d "www.$domain" --redirect; then
+    warn "Certbot failed (likely DNS/propagation). Site remains on HTTP; retry later with: sudo certbot --nginx -d $domain -d www.$domain"
+  fi
 
-Database: ${db_name}
-DB User:  ${db_user}
-DB Pass:  ${db_pass}
-========================================
-EOF
-  chmod 600 "$cred"
-
-  clear
-  echo -e "${c_green}✔ Site installed successfully!${c_nc}"
-  echo
-  echo "Installation Report:"
-  echo " - Domain:        https://${domain}"
-  echo " - Admin URL:     https://${domain}/wp-admin"
-  echo " - Admin User:    ${admin_user}"
-  echo " - Admin Pass:    ${admin_pass}"
-  echo " - DB Name:       ${db_name}"
-  echo " - DB User:       ${db_user}"
-  echo " - SSL:           $( [[ -f /etc/letsencrypt/live/${domain}/fullchain.pem ]] && echo Issued || echo Pending/Failed )"
-  echo " - Redis:         Enabled"
-  echo " - Cache:         FastCGI (ON)"
-  echo " - Cron:          System cron enabled"
-  echo
-  echo "Credentials saved at: ${cred}"
-  press_any
-  CTX=()
+  save_credentials "$domain" "$admin_user" "$admin_pass" "$db_name" "$db_user" "$db_pass"
+  success "Site '${domain}' installed."
+  SITE_DATA=()
 }
 
-remove_wp_site(){
-  clear; echo -e "${c_red}--- Remove WordPress Site ---${c_nc}\n"
-  local domain
-  read -rp "Domain to remove (example.com): " domain
-  [[ -n "$domain" ]] || { warn "No domain provided."; press_any; return; }
+remove_site() {
+  clear; echo -e "${RED}--- Remove WordPress Site ---${NC}\n"
+  local domain; domain=$(select_site) || return
+  warn "This will permanently delete ${domain} (files, DB, users, config)."
+  read -rp "Type the domain to confirm: " confirm
+  [[ "$confirm" == "$domain" ]] || { warn "Confirmation mismatch. Aborted."; return; }
 
+  remove_site_silent "$domain"
+  success "Site ${domain} removed."
+}
+
+remove_site_silent() {
+  local domain="$1"
   local site_dir="${WEBROOT}/${domain}"
-  if [[ ! -d "$site_dir" ]]; then
-    warn "No site found at ${site_dir}."
-    press_any; return
-  fi
-
-  echo -e "${c_yellow}This will permanently delete files, DB, user, and Nginx/PHP configs for ${domain}.${c_nc}"
-  read -rp "Type the domain again to confirm: " confirm_domain
-  [[ "$confirm_domain" == "$domain" ]] || { warn "Confirmation mismatch. Aborting."; press_any; return; }
-
-  local db_name=""; local db_user=""
+  local db_name db_user
   if [[ -f "${site_dir}/wp-config.php" ]]; then
-    db_name=$(grep "DB_NAME" "${site_dir}/wp-config.php" | cut -d \' -f 4 || true)
-    db_user=$(grep "DB_USER" "${site_dir}/wp-config.php" | cut -d \' -f 4 || true)
+    db_name=$(grep "DB_NAME" "${site_dir}/wp-config.php" | cut -d\' -f4)
+    db_user=$(grep "DB_USER" "${site_dir}/wp-config.php" | cut -d\' -f4)
   fi
 
-  rm -f "/etc/nginx/sites-available/${domain}" "/etc/nginx/sites-enabled/${domain}"
-  rm -f "/etc/php/${PHP_VERSION}/fpm/pool.d/${domain}.conf"
-  systemctl reload nginx "php${PHP_VERSION}-fpm" || true
-
-  if [[ -n "$db_name" ]]; then
-    mysql --defaults-file=/root/.my.cnf -e "DROP DATABASE IF EXISTS \`${db_name}\`;"
-    mysql --defaults-file=/root/.my.cnf -e "DROP USER IF EXISTS '${db_user}'@'localhost';"
+  sudo rm -f "/etc/nginx/sites-available/${domain}" "/etc/nginx/sites-enabled/${domain}"
+  sudo rm -f "/etc/php/${PHP_VERSION}/fpm/pool.d/${domain}.conf"
+  if [[ -n "${db_name:-}" ]]; then
+    mysql --defaults-file="$HOME/.my.cnf" -e "DROP DATABASE IF EXISTS ${db_name}; DROP USER IF EXISTS '${db_user}'@'localhost'; FLUSH PRIVILEGES;"
   fi
-
-  rm -rf "${site_dir}"
-
-  ok "Site ${domain} removed."
-  press_any
+  sudo rm -rf "$site_dir"
+  sudo systemctl reload nginx "php${PHP_VERSION}-fpm"
 }
 
-list_sites(){
-  clear; echo -e "${c_blue}--- Managed Sites ---${c_nc}\n"
-  if ls -1 "${WEBROOT}" | grep -v '^html$' 2>/dev/null; then :; else echo "No sites found."; fi
-  echo; press_any
-}
-
-manage_cache(){
-  clear; echo -e "${c_blue}--- Manage Cache ---${c_nc}\n"
-  read -rp "Domain: " domain
-  local conf="/etc/nginx/sites-available/${domain}"
-  [[ -f "$conf" ]] || { warn "Vhost not found."; press_any; return; }
-
-  if grep -q "fastcgi_cache WORDPRESS" "$conf"; then
-    echo "Cache is currently: ON"
-    read -rp "Turn OFF cache? (y/N): " a
-    if [[ "$a" =~ ^[Yy]$ ]]; then
-      nginx_site_write "$domain" "${WEBROOT}/${domain}" "off"
-      ok "Cache disabled."
-    fi
+list_sites() {
+  clear; echo -e "${BLUE}--- Managed WordPress Sites ---${NC}\n"
+  if ls -1 "${WEBROOT}" 2>/dev/null | grep -v '^html$' >/dev/null; then
+    ls -1 "${WEBROOT}" | grep -v '^html$' | sed 's/^/ - /'
   else
-    echo "Cache is currently: OFF"
-    read -rp "Turn ON cache? (y/N): " a
-    if [[ "$a" =~ ^[Yy]$ ]]; then
-      nginx_site_write "$domain" "${WEBROOT}/${domain}" "on"
-      ok "Cache enabled."
-    fi
+    warn "No sites found."
   fi
-  press_any
 }
 
-xmlrpc_whitelist_menu(){
-  clear; echo -e "${c_blue}--- XML-RPC Whitelist (Global) ---${c_nc}\n"
-  echo "Current entries:"
-  grep -E "^\s*([0-9]{1,3}\.){3}[0-9]{1,3}" "$XMLRPC_WHITELIST_FILE" | awk '{print " - " $1}' || echo " - None"
-  echo
-  echo "1) Add IP to whitelist (e.g., your Odoo server)"
-  echo "2) Remove IP from whitelist"
+select_site() {
+  local arr=()
+  mapfile -t arr < <(ls -1 "${WEBROOT}" 2>/dev/null | grep -v '^html$' || true)
+  ((${#arr[@]})) || { warn "No sites available."; return 1; }
+  echo "Select a site:"
+  local i
+  for i in "${!arr[@]}"; do echo "  $((i+1))) ${arr[$i]}"; done
+  local choice; read -rp "Enter number: " choice
+  [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#arr[@]} )) || { warn "Invalid."; return 1; }
+  echo "${arr[$((choice-1))]}"
+}
+
+manage_caching() {
+  clear; echo -e "${BLUE}--- Manage Site Caching ---${NC}\n"
+  local domain; domain=$(select_site) || return
+  local conf="/etc/nginx/sites-available/${domain}"
+  if grep -q "fastcgi_cache WORDPRESS;" "$conf"; then
+    echo -e "Current: ${GREEN}ENABLED${NC}"
+    read -rp "Disable caching? (y/N): " a; [[ "${a,,}" == "y" ]] && { configure_nginx_site "$domain" "false"; success "Cache disabled."; }
+  else
+    echo -e "Current: ${RED}DISABLED${NC}"
+    read -rp "Enable caching? (y/N): " a; [[ "${a,,}" == "y" ]] && { configure_nginx_site "$domain" "true"; success "Cache enabled."; }
+  fi
+}
+
+manage_xmlrpc() {
+  clear; echo -e "${BLUE}--- Manage XML-RPC Whitelist (global) ---${NC}\n"
+  while true; do
+    echo "Whitelisted IPs:"
+    grep -E '^[[:space:]]*([0-9]{1,3}\.){3}[0-9]{1,3}[[:space:]]+1;' "$XMLRPC_WHITELIST_FILE" 2>/dev/null \
+      | awk '{print " - " $1}' || echo " - None"
+    echo -e "\n1) Add IP  2) Remove IP  3) Back"
+    read -rp "Choice: " c
+    case "$c" in
+      1)
+        read -rp "IP to add: " ip
+        [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { warn "Invalid IP."; continue; }
+        if grep -q "$ip" "$XMLRPC_WHITELIST_FILE"; then warn "Already present."
+        else
+          sudo sed -i "/^geo /a \    ${ip} 1;" "$XMLRPC_WHITELIST_FILE"
+          sudo nginx -t && sudo systemctl reload nginx
+          success "Added."
+        fi
+        ;;
+      2)
+        read -rp "IP to remove: " ip
+        if sudo grep -q "$ip" "$XMLRPC_WHITELIST_FILE"; then
+          sudo sed -i "/${ip}[[:space:]]\+1;/d" "$XMLRPC_WHITELIST_FILE"
+          sudo nginx -t && sudo systemctl reload nginx
+          success "Removed."
+        else
+          warn "Not found."
+        fi
+        ;;
+      3) break ;;
+      *) warn "Invalid." ;;
+    esac
+  done
+}
+
+create_on_demand_backup() {
+  local domain; domain=$(select_site) || return
+  local site_dir="${WEBROOT}/${domain}"
+  local backup_dir="$HOME/woo_backups/${domain}"
+  mkdir -p "$backup_dir"
+
+  local ts; ts="$(date +%Y%m%d_%H%M%S)"
+  local file_backup="${backup_dir}/files_${ts}.tar.gz"
+  local db_backup="${backup_dir}/db_${ts}.sql"
+  local tmp_db="/tmp/db_${domain}_${ts}.sql"
+
+  local db_name; db_name=$(sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get DB_NAME --path="$site_dir" --quiet)
+  sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp db export "$tmp_db" --path="$site_dir"
+  sudo mv "$tmp_db" "$db_backup"
+  sudo tar -czf "$file_backup" -C "$WEBROOT" "$domain"
+
+  success "Backup complete.\n  Files: $file_backup\n  DB:    $db_backup"
+}
+
+configure_scheduled_backups() {
+  clear; echo -e "${BLUE}--- Scheduled Backups ---${NC}\n"
+  read -rp "Enable daily backups at 02:00? (y/N): " a
+  if [[ "${a,,}" != "y" ]]; then
+    (crontab -l 2>/dev/null | grep -v "${SCRIPT_PATH} backup-all") | crontab - || true
+    success "Scheduled backups disabled."
+    return
+  fi
+
+  mkdir -p "$CONFIG_DIR"
+  read -rp "Enable off-site rsync/scp? (y/N): " r
+  if [[ "${r,,}" == "y" ]]; then
+    read -rp "Remote user: " RU; read -rp "Remote host: " RH; read -rp "Remote path: " RP
+    printf "REMOTE_USER=%s\nREMOTE_HOST=%s\nREMOTE_PATH=%s\n" "$RU" "$RH" "$RP" > "$BACKUP_CONFIG_FILE"
+    chmod 600 "$BACKUP_CONFIG_FILE"
+    warn "Ensure SSH keys are set up for passwordless transfer."
+  else
+    rm -f "$BACKUP_CONFIG_FILE" || true
+  fi
+
+  (crontab -l 2>/dev/null | grep -v "${SCRIPT_PATH} backup-all"; echo "0 2 * * * bash ${SCRIPT_PATH} backup-all") | crontab -
+  success "Daily backups scheduled."
+}
+
+backup_all_sites() {
+  log "--- All-Sites Scheduled Backup ---"
+  local s; mapfile -t s < <(ls -1 "${WEBROOT}" 2>/dev/null | grep -v '^html$' || true)
+  for domain in "${s[@]}"; do
+    local sd="${WEBROOT}/${domain}" bd="$HOME/woo_backups/${domain}"
+    mkdir -p "$bd"
+    local d; d="$(date +%Y%m%d)"
+    local tmp_db="/tmp/db_${domain}_${d}.sql"
+    local db_name; db_name=$(sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get DB_NAME --path="$sd" --quiet)
+    sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp db export "$tmp_db" --path="$sd"
+    local archive="${bd}/full_${d}.tar.gz"
+    sudo tar -czf "$archive" -C "$WEBROOT" "$domain" -C /tmp "$(basename "$tmp_db")"
+    sudo rm -f "$tmp_db"
+    log "Backup: $archive"
+
+    if [[ -f "$BACKUP_CONFIG_FILE" ]]; then
+      # shellcheck disable=SC1090
+      source "$BACKUP_CONFIG_FILE"
+      rsync -a -e ssh "$archive" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}" || warn "Off-site sync failed for ${domain}"
+    fi
+
+    # keep 7 newest
+    ls -tp "${bd}"/full_*.tar.gz 2>/dev/null | tail -n +8 | xargs -r -d '\n' rm -f --
+  done
+  log "--- Backups Done ---"
+}
+
+clone_to_staging() {
+  clear; echo -e "${BLUE}--- Clone Site to Staging ---${NC}\n"
+  local domain; domain=$(select_site) || return
+  local staging="staging.${domain}"
+  local sd="${WEBROOT}/${domain}"
+  local td="${WEBROOT}/${staging}"
+
+  [[ -d "$sd" ]] || { warn "Source does not exist."; return; }
+  [[ -d "$td" ]] && { warn "Staging exists. Removing."; remove_site_silent "$staging"; }
+
+  log "Cloning files..."
+  sudo cp -a "$sd" "$td"
+
+  log "Cloning DB..."
+  local db_name db_user
+  db_name=$(sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get DB_NAME --path="$sd" --quiet)
+  db_user=$(sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get DB_USER --path="$sd" --quiet)
+  local sdb="${db_name}_stg_$(openssl rand -hex 3)"
+
+  mysql --defaults-file="$HOME/.my.cnf" -e "CREATE DATABASE ${sdb};"
+  mysqldump --defaults-file="$HOME/.my.cnf" "${db_name}" | mysql --defaults-file="$HOME/.my.cnf" "${sdb}"
+  mysql --defaults-file="$HOME/.my.cnf" -e "GRANT ALL PRIVILEGES ON ${sdb}.* TO '${db_user}'@'localhost'; FLUSH PRIVILEGES;"
+
+  log "Pointing staging to new DB..."
+  sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set DB_NAME "$sdb" --path="$td"
+
+  log "Search-replace URLs..."
+  sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp search-replace "https://${domain}" "https://${staging}" --all-tables --path="$td"
+
+  create_php_pool "$staging"
+  configure_nginx_site "$staging" "false"
+
+  local admin_email; admin_email=$(sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp option get admin_email --path="$sd" --quiet || echo "admin@${domain}")
+  if ! sudo certbot --nginx --hsts --staple-ocsp --non-interactive --agree-tos -m "$admin_email" -d "$staging" --redirect; then
+    warn "Staging SSL failed. Check DNS for ${staging}."
+  fi
+
+  sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp option update blog_public 0 --path="$td"
+  success "Staging ready: https://${staging}"
+}
+
+site_toolkit() {
+  clear; echo -e "${BLUE}--- Site Toolkit ---${NC}\n"
+  local domain; domain=$(select_site) || return
+  local dir="${WEBROOT}/${domain}"
+  while true; do
+    echo -e "\n${YELLOW}${domain}${NC}"
+    echo "1) List users"
+    echo "2) Optimize DB"
+    echo "3) List cron events"
+    echo "4) Quick health (checksums, plugin status)"
+    echo "5) Back"
+    read -rp "Choice: " c
+    case "$c" in
+      1) sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp user list --path="$dir" ;;
+      2) sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp db optimize --path="$dir" ;;
+      3) sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp cron event list --path="$dir" ;;
+      4)
+        sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp core verify-checksums --path="$dir" || true
+        sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp plugin status --path="$dir" || true
+        ;;
+      5) break ;;
+      *) warn "Invalid." ;;
+    esac
+    read -n 1 -s -r -p "Press any key..."
+  done
+}
+
+manage_debugging() {
+  clear; echo -e "${BLUE}--- Debugging ---${NC}\n"
+  local domain; domain=$(select_site) || return
+  local dir="${WEBROOT}/${domain}"
+  while true; do
+    local dbg; dbg=$(sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config get WP_DEBUG --path="$dir" --quiet && echo ON || echo OFF)
+    echo "WP_DEBUG: $dbg"
+    echo "1) Toggle WP_DEBUG"
+    echo "2) Tail debug.log"
+    echo "3) Back"
+    read -rp "Choice: " c
+    case "$c" in
+      1)
+        if [[ "$dbg" == "ON" ]]; then
+          sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set WP_DEBUG false --raw --path="$dir"
+          sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set WP_DEBUG_LOG false --raw --path="$dir"
+          sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set WP_DEBUG_DISPLAY false --raw --path="$dir"
+        else
+          sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set WP_DEBUG true --raw --path="$dir"
+          sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set WP_DEBUG_LOG true --raw --path="$dir"
+          sudo -u www-data WP_CLI_CACHE_DIR='/tmp/wp-cli-cache' wp config set WP_DEBUG_DISPLAY false --raw --path="$dir"
+        fi
+        success "Toggled."
+        ;;
+      2)
+        log "Tailing ${dir}/wp-content/debug.log (Ctrl+C to stop)"
+        sudo tail -f "${dir}/wp-content/debug.log" || true
+        ;;
+      3) break ;;
+      *) warn "Invalid." ;;
+    esac
+  done
+}
+
+manage_backups() {
+  clear; echo -e "${BLUE}--- Backups ---${NC}\n"
+  echo "1) Create On-Demand Backup"
+  echo "2) Configure Scheduled Backups"
   echo "3) Back"
   read -rp "Choice: " c
   case "$c" in
-    1)
-      read -rp "Enter IP to ALLOW: " ip
-      if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-        if grep -q "$ip" "$XMLRPC_WHITELIST_FILE"; then
-          warn "IP already present."
-        else
-          sed -i "/^geo /a\ \ \ \ ${ip} 1;" "$XMLRPC_WHITELIST_FILE"
-          nginx -t && systemctl reload nginx
-          ok "Added ${ip}."
-        fi
-      else
-        warn "Invalid IP format."
-      fi
-      ;;
-    2)
-      read -rp "Enter IP to REMOVE: " ip
-      if grep -q "$ip" "$XMLRPC_WHITELIST_FILE"; then
-        sed -i "/${ip}/d" "$XMLRPC_WHITELIST_FILE"
-        nginx -t && systemctl reload nginx
-        ok "Removed ${ip}."
-      else
-        warn "IP not found."
-      fi
-      ;;
-    *);;
-  esac
-  press_any
-}
-
-backups_menu(){
-  clear; echo -e "${c_blue}--- Backups (Local Only) ---${c_nc}\n"
-  echo "1) Backup a single site now"
-  echo "2) Backup ALL sites now"
-  echo "3) Schedule daily backups at 02:00"
-  echo "4) Disable scheduled backups"
-  echo "5) Back"
-  read -rp "Choice: " c
-  case "$c" in
-    1) read -rp "Domain: " domain; backup_site "$domain" ;;
-    2) backup_all_sites ;;
-    3) (crontab -l 2>/dev/null | grep -v "woo.sh backup-all"; echo "0 2 * * * /usr/bin/env bash /root/woo.sh backup-all >> /var/log/woo-toolkit/backup.log 2>&1") | crontab - ; ok "Daily backups scheduled."; press_any ;;
-    4) (crontab -l 2>/dev/null | grep -v "woo.sh backup-all") | crontab - ; ok "Scheduled backups disabled."; press_any ;;
-    *) ;;
+    1) create_on_demand_backup ;;
+    2) configure_scheduled_backups ;;
+    *) : ;;
   esac
 }
 
-backup_site(){
-  local domain="$1"
-  local dir="${WEBROOT}/${domain}"
-  [[ -d "$dir" ]] || { warn "No site found at ${dir}."; press_any; return; }
-
-  log "Backing up ${domain}…"
-  local out="/root/woo_backups/${domain}"; mkdir -p "$out"
-  local ts="$(date +%Y%m%d_%H%M%S)"
-  local archive="${out}/full_${ts}.tar.gz"
-  local db="$(sudo -u www-data wp config get DB_NAME --path="$dir" --quiet || echo)"
-  local tmpdb="/tmp/db_${domain}_${ts}.sql"
-  if [[ -n "$db" ]]; then
-    sudo -u www-data wp db export "$tmpdb" --path="$dir" || true
-    tar -czf "$archive" -C "$dir" . -C /tmp "$(basename "$tmpdb")"
-    rm -f "$tmpdb"
-  else
-    tar -czf "$archive" -C "$dir" .
-  fi
-  ls -tp "${out}"/full_*.tar.gz 2>/dev/null | tail -n +8 | xargs -r -d $'\n' rm -f --
-  ok "Backup stored at: ${archive}"
-  press_any
-}
-
-backup_all_sites(){
-  log "--- Backing up all sites ---"
-  for s in $(ls -1 "${WEBROOT}" 2>/dev/null | grep -v '^html$' || true); do
-    backup_site "$s"
-  done
-  ok "All backups complete."
-}
-
-doctor_report(){
-  clear; echo -e "${c_blue}--- System Doctor Report ---${c_nc}\n"
-  echo "- OS: $(. /etc/os-release; echo "$PRETTY_NAME")"
-  echo "- Nginx: $(nginx -v 2>&1)"
-  echo "- PHP-FPM: $(php-fpm${PHP_VERSION} -v 2>/dev/null | head -n1 || echo php${PHP_VERSION})"
-  echo "- MariaDB: $(mysql --version)"
-  echo "- Redis: $(redis-server --version 2>/dev/null | head -n1 || echo 'installed')"
-  echo "- RAM total: $(awk '/MemTotal/ {print int($2/1024) "MB"}' /proc/meminfo)"
-  echo "- Free disk (/): $(df -h / | awk 'NR==2{print $4 " free"}')"
-  echo "- Nginx config test:"; nginx -t || true
-  echo "- SSL certs expiring in <14 days:"
-  for d in /etc/letsencrypt/live/*; do
-    [[ -d "$d" ]] || continue
-    local crt="$d/fullchain.pem"; [[ -f "$crt" ]] || continue
-    local exp_ts=$(date -d "$(openssl x509 -enddate -noout -in "$crt" | cut -d= -f2)" +%s)
-    local now=$(date +%s); local diff=$(( (exp_ts-now)/86400 ))
-    (( diff < 14 )) && echo "  - $(basename "$d"): ${diff}d"
-  done
-  echo; press_any
-}
-
-# --------------------------- First-run Setup --------------------------------
-first_run_setup(){
-  preflight
-  ensure_swap
-  install_stack
-  secure_mariadb
-  tune_mariadb
-  harden_php
-  harden_imagick
-  harden_firewall_fail2ban
-  nginx_global
-  systemd_logrotate
-
-  # Create the 'woo' convenience command
-  cat >/usr/local/bin/woo <<'EOF'
-#!/usr/bin/env bash
-exec sudo -E bash /root/woo.sh "$@"
-EOF
-  chmod +x /usr/local/bin/woo
-
-  ok "Base server setup complete. Next time, just type: woo"
-  press_any
-}
-
-# --------------------------- Menu -------------------------------------------
-main_menu(){
+# ------------------------------- Menu -----------------------------------------
+main_menu() {
   while true; do
     clear
-    echo -e "${c_blue}=====================================================${c_nc}"
-    echo -e "${c_blue} WOO — WordPress Operations Orchestrator (v12)      ${c_nc}"
-    echo -e "${c_blue}=====================================================${c_nc}\n"
-    echo " 1) Add New Site"
-    echo " 2) Remove Site"
-    echo " 3) List Sites"
-    echo " 4) Manage Cache"
-    echo " 5) XML-RPC Whitelist"
-    echo " 6) Backups"
-    echo " 7) Doctor (Report)"
-    echo " 8) Exit"
-    echo
-    read -rp "Choose an option [1-8]: " ans
-    case "$ans" in
-      1) create_wp_site ;;
-      2) remove_wp_site ;;
-      3) list_sites ;;
-      4) manage_cache ;;
-      5) xmlrpc_whitelist_menu ;;
-      6) backups_menu ;;
-      7) doctor_report ;;
-      8) clear; exit 0 ;;
-      *) warn "Invalid option." ; press_any ;;
-    case_esac
+    echo -e "${BLUE}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ WordPress Ultimate Operations (WOO) ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC}"
+    echo " 1) List Managed Sites"
+    echo " 2) Add New Site (Standard/Multisite)"
+    echo " 3) Remove Existing Site"
+    echo " 4) Manage Site Caching"
+    echo " 5) Manage XML-RPC Whitelist"
+    echo " 6) Backup Management"
+    echo " 7) Clone Site to Staging"
+    echo " 8) Site Toolkit"
+    echo " 9) Debugging Tools"
+    echo "10) Setup SSH MFA (google-authenticator)"
+    echo "11) Exit"
+    read -rp "Choose: " ch
+    case "$ch" in
+      1) list_sites ;;
+      2) add_site ;;
+      3) remove_site ;;
+      4) manage_caching ;;
+      5) manage_xmlrpc ;;
+      6) manage_backups ;;
+      7) clone_to_staging ;;
+      8) site_toolkit ;;
+      9) manage_debugging ;;
+      10) sudo apt-get install -y libpam-google-authenticator && google-authenticator || warn "MFA setup skipped." ;;
+      11) echo "Bye."; exit 0 ;;
+      *) warn "Invalid option." ;;
+    esac
+    echo -e "\nPress any key to return to menu..."
+    read -n 1 -s || true
   done
 }
 
-# --------------------------- Entry Point ------------------------------------
-main(){
-  # Normalize line endings if needed (harmless if already fine)
-  command -v dos2unix >/dev/null 2>&1 || { apt-get update -y && apt-get install -y dos2unix; }
-  dos2unix "$0" >/dev/null 2>&1 || true
-  perl -i -pe 's/\r$//' "$0" || true
+# ------------------------------- Entry ----------------------------------------
+main() {
+  # CRON entry points
+  if [[ "${1:-}" == "backup-all" ]]; then backup_all_sites; exit 0; fi
+  if [[ "${1:-}" == "remove-site-silent" && -n "${2:-}" ]]; then remove_site_silent "$2"; exit 0; fi
 
-  # Detect PHP version after packages (or default for paths)
-  if [[ -z "$PHP_VERSION" ]]; then
-    for v in "${PHP_CANDIDATES[@]}"; do
-      [[ -d "/etc/php/${v}" ]] && PHP_VERSION="$v" && break
-    done
-    [[ -z "$PHP_VERSION" ]] && PHP_VERSION="8.2"
-  fi
+  require_sudo
+  check_os
+  ensure_swap_if_low_ram
+  install_dependencies
+  configure_nginx_includes
+  secure_mysql
+  configure_tuned_mariadb
+  harden_server
+  setup_alias
 
-  # One-time base setup
-  if [[ ! -f /root/.woo-first-run-complete ]]; then
-    first_run_setup
-    touch /root/.woo-first-run-complete
-  fi
-
-  # Always show the menu
+  success "Initial server setup complete."
   main_menu
 }
 
